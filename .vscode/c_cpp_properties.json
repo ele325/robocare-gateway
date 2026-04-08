@@ -2,9 +2,17 @@
   "configurations": [
     {
       "name": "ESP-IDF",
+      "compilerPath": "C:\\Espressif\\tools\\xtensa-esp-elf\\esp-13.2.0_20240530\\xtensa-esp-elf\\bin\\xtensa-esp32s2-elf-gcc.exe",
+      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
       "includePath": [
+        "${workspaceFolder}/components/common/include",
+        "${workspaceFolder}/components/lora_manager/include",
+        "${workspaceFolder}/components/sd_manager/include",
+        "${workspaceFolder}/components/network_manager/include",
+        "${workspaceFolder}/components/relay_manager/include",
         "${workspaceFolder}/**",
         "${workspaceFolder}/build/**",
+        "${workspaceFolder}/components/ble_provisioning_manager/include",
         "C:/Espressif/frameworks/esp-idf-v5.3.1/components/**",
         "C:/Espressif/frameworks/esp-idf-v5.3.1/components/driver/deprecated",
         "C:/Espressif/frameworks/esp-idf-v5.3.1/components/esp_wifi/include",
@@ -48,11 +56,10 @@
         "__xtensa__",
         "UINT32_MAX=0xFFFFFFFFU"
       ],
-      "compilerPath": "C:\\Espressif\\tools\\xtensa-esp-elf\\esp-13.2.0_20240530\\xtensa-esp-elf\\bin\\xtensa-esp32s2-elf-gcc.exe",
-      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
       "cStandard": "c17",
       "cppStandard": "c++17",
-      "intelliSenseMode": "gcc-x64"
+      "intelliSenseMode": "${default}",
+      "mergeConfigurations": true
     }
   ],
   "version": 4
