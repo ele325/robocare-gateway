@@ -1,16 +1,3 @@
-/**
- * @file lora_manager.c
- * @brief Driver LoRa Ra-02 (SX1278) — Carte RÉCEPTRICE RoboCare
- *
- * Corrections v2.1 :
- *  1. SPI3_HOST utilisé au lieu de SPI2_HOST (LoRa sur bus séparé de la SD)
- *  2. parse_lora_message() corrigé : accepte 8 tokens (format émetteur)
- *     Format émetteur : "NODE_ID;humidity;temperature;ph;ec;N;P;K"
- *     Exemple         : "1;32.6;20.5;7.22;75;8;8;21"
- *     L'ancienne version attendait 10 tokens avec "N" prefix et date/heure
- *     → parsing toujours échoué → aucune donnée reçue
- */
-
 #include "lora_manager.h"
 
 #include "driver/spi_master.h"
@@ -28,9 +15,6 @@ static const char *TAG = "LORA_RX";
 static spi_device_handle_t  s_spi_lora  = NULL;
 static lora_data_callback_t s_callback  = NULL;
 
-/* =========================================================================
- * Registres SX1278
- * ========================================================================= */
 #define REG_FIFO                 0x00
 #define REG_OP_MODE              0x01
 #define REG_FR_MSB               0x06
@@ -48,16 +32,12 @@ static lora_data_callback_t s_callback  = NULL;
 #define REG_MODEM_CONFIG2        0x1E
 #define REG_VERSION              0x42
 
-/* Modes LoRa */
 #define LORA_MODE_SLEEP          0x80
 #define LORA_MODE_STDBY          0x81
 #define LORA_MODE_RXCONT         0x85
 
 #define SX1278_VERSION           0x12
 
-/* =========================================================================
- * Helpers SPI full-duplex
- * ========================================================================= */
 static uint8_t lora_read_byte(uint8_t addr)
 {
     uint8_t tx[2] = { addr & 0x7F, 0x00 };
@@ -85,65 +65,51 @@ static void lora_write_byte(uint8_t addr, uint8_t value)
     spi_device_transmit(s_spi_lora, &t);
 }
 
-/* =========================================================================
- * parse_lora_message
- *
- * CORRECTION v2.1 — format aligné sur l'émetteur :
- *
- * L'émetteur (main_emettrice.c) envoie :
- *   "%d;%.1f;%.1f;%.2f;%.0f;%.0f;%.0f;%.0f"
- *   NODE_ID ; humidity ; temperature ; ph ; ec ; N ; P ; K
- *   Exemple : "1;32.6;20.5;7.22;75;8;8;21"   → 8 tokens
- *
- * L'ancienne version attendait 10 tokens avec préfixe "N" et date/heure
- * → n < 10 toujours vrai → return false → aucune donnée jamais reçue.
- *
- * Nouvelle version : 8 tokens minimum, pas de préfixe "N".
- * date et time_str remplis avec "N/A" (pas disponibles dans ce format).
- * ========================================================================= */
 static bool parse_lora_message(const uint8_t *raw, int len,
-                                lora_sensor_data_t *out)
+                               lora_sensor_data_t *out)
 {
     if (!raw || len <= 0 || !out) return false;
 
-    char msg[128];
-    if (len > 127) len = 127;
+    char msg[160];
+    if (len > (int)(sizeof(msg) - 1)) len = sizeof(msg) - 1;
     memcpy(msg, raw, len);
     msg[len] = '\0';
 
     ESP_LOGI(TAG, "Paquet brut : %s", msg);
 
-    /* Tokenisation sur ';' */
-    char buf[128];
+    char buf[160];
     strncpy(buf, msg, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    char *tokens[10];
-    int   n   = 0;
+    char *tokens[12];
+    int n = 0;
+
     char *tok = strtok(buf, ";");
-    while (tok && n < 10) {
+    while (tok && n < 12) {
         tokens[n++] = tok;
         tok = strtok(NULL, ";");
     }
 
-    /* Format émetteur : minimum 8 tokens */
-    if (n < 8) {
-        ESP_LOGW(TAG, "Message incomplet : %d tokens (min 8 attendus)", n);
+    /* FORMAT OFFICIEL :
+     * [0] NODE_ID
+     * [1] humidity
+     * [2] temperature
+     * [3] ph
+     * [4] ec
+     * [5] nitrogen
+     * [6] phosphorus
+     * [7] potassium
+     * [8] date
+     * [9] time
+     */
+    if (n < 10) {
+        ESP_LOGW(TAG, "Message incomplet : %d tokens (min 10 attendus)", n);
         ESP_LOGW(TAG, "  → Contenu reçu : %s", msg);
         return false;
     }
 
-    /*
-     * Ordre des tokens (format émetteur main_emettrice.c) :
-     *   [0] = NODE_ID      (entier, ex: "1")
-     *   [1] = humidity     (float, ex: "32.6")
-     *   [2] = temperature  (float, ex: "20.5")
-     *   [3] = ph           (float, ex: "7.22" ou "-1.00")
-     *   [4] = ec           (float, ex: "75")
-     *   [5] = nitrogen     (float, ex: "8")
-     *   [6] = phosphorus   (float, ex: "8")
-     *   [7] = potassium    (float, ex: "21")
-     */
+    memset(out, 0, sizeof(*out));
+
     out->node_id = atoi(tokens[0]);
     if (out->node_id < 1 || out->node_id > 254) {
         ESP_LOGW(TAG, "node_id invalide : %d", out->node_id);
@@ -152,21 +118,22 @@ static bool parse_lora_message(const uint8_t *raw, int len,
 
     out->humidity    = strtof(tokens[1], NULL);
     out->temperature = strtof(tokens[2], NULL);
-    out->ph          = strtof(tokens[3], NULL);  /* -1.0 si invalide */
+    out->ph          = strtof(tokens[3], NULL);
     out->ec          = strtof(tokens[4], NULL);
     out->nitrogen    = strtof(tokens[5], NULL);
     out->phosphorus  = strtof(tokens[6], NULL);
     out->potassium   = strtof(tokens[7], NULL);
 
-    /* Date/heure non transmises dans ce format → N/A */
-    strncpy(out->date,     "N/A", sizeof(out->date)     - 1);
-    strncpy(out->time_str, "N/A", sizeof(out->time_str) - 1);
-    out->date[sizeof(out->date) - 1]         = '\0';
+    strncpy(out->date, tokens[8], sizeof(out->date) - 1);
+    out->date[sizeof(out->date) - 1] = '\0';
+
+    strncpy(out->time_str, tokens[9], sizeof(out->time_str) - 1);
     out->time_str[sizeof(out->time_str) - 1] = '\0';
 
     return true;
 }
 
+/* Le reste du fichier (init, RX, callback...) reste inchangé */
 /* =========================================================================
  * lora_manager_init
  *

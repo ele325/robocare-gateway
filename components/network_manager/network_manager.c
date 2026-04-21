@@ -440,42 +440,68 @@ void network_manager_start(void)
 
 void network_manager_publish_sensor_data(const lora_sensor_data_t *data)
 {
-    if (!data || !s_mqtt_client) return;
+    if (!data) {
+        ESP_LOGW(TAG, "network_manager_publish_sensor_data: data=NULL");
+        return;
+    }
 
-    if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) {
-        ESP_LOGD(TAG, "Publication annulée — WiFi non connecté");
+    if (!s_mqtt_client) {
+        ESP_LOGW(TAG, "MQTT client non initialisé");
         return;
     }
 
     if (!s_uid_received || strlen(s_uid) == 0) {
-        ESP_LOGW(TAG, "Publication annulée — UID non reçu");
-        ESP_LOGW(TAG, "  → Claimez ce device (MAC: %s) dans l'app", s_mac_str);
+        ESP_LOGW(TAG, "UID non reçu — publication annulée");
         return;
     }
 
-    /*
-     * Topic aligné sur config.py du bridge Python :
-     *   MQTT_TOPIC_DATA = "robocare/+/zone/+/data"
-     *   → on publie sur "robocare/<uid>/zone/<node_id>/data"
-     */
-    char topic[96];
-    snprintf(topic, sizeof(topic),
-             "robocare/%s/zone/%d/data", s_uid, data->node_id);
-
-    /*
-     * Payload JSON aligné sur firebase_service.py du bridge :
-     *   payload['measurements']['moisture_percent']
-     *   payload['measurements']['temperature_celsius']
-     *   payload['measurements']['ph']
-     *   payload['measurements']['conductivity_uS_per_cm']
-     *   payload['measurements']['nutrients_mg_per_kg']['nitrogen']
-     *   payload['measurements']['nutrients_mg_per_kg']['phosphorus']
-     *   payload['measurements']['nutrients_mg_per_kg']['potassium']
+    /* ---------------------------------------------------------------------
+     * ALIGNEMENT AVEC LE BRIDGE PYTHON
      *
-     * ✓ Sécurité JSON : Validation des flottants dans snprintf
-     * Évite les NaN/Inf qui corrompent le payload
-     */
-    char payload[512];
+     * Topic attendu par mqtt_handler.py :
+     *   robocare/{uid}/zone/{zone_num}/sensor/{sensor_id}/data
+     *
+     * Ici, comme ton architecture actuelle associe un nœud LoRa à une zone
+     * et à un capteur unique, on prend par défaut :
+     *   zone_num  = node_id
+     *   sensor_id = node_id
+     *
+     * Si plus tard tu veux plusieurs capteurs par zone, il faudra séparer
+     * ces deux identifiants.
+     * --------------------------------------------------------------------- */
+    int zone_num  = data->node_id;
+    int sensor_id = data->node_id;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic),
+             "robocare/%s/zone/%d/sensor/%d/data",
+             s_uid, zone_num, sensor_id);
+
+    /* ---------------------------------------------------------------------
+     * PAYLOAD attendu par firebase_service.py :
+     * {
+     *   "measurements": {
+     *      "moisture_percent": ...,
+     *      "temperature_celsius": ...,
+     *      "ph": ...,
+     *      "conductivity_uS_per_cm": ...,
+     *      "nutrients_mg_per_kg": {
+     *          "nitrogen": ...,
+     *          "phosphorus": ...,
+     *          "potassium": ...
+     *      }
+     *   },
+     *   "meta": {
+     *      "mac": ...,
+     *      "node_id": ...,
+     *      "rssi": ...,
+     *      "snr": ...,
+     *      "date": ...,
+     *      "time": ...
+     *   }
+     * }
+     * --------------------------------------------------------------------- */
+    char payload[768];
     snprintf(payload, sizeof(payload),
              "{"
                "\"measurements\":{"
@@ -490,10 +516,12 @@ void network_manager_publish_sensor_data(const lora_sensor_data_t *data)
                  "}"
                "},"
                "\"meta\":{"
-                 "\"node_id\":%d,"
                  "\"mac\":\"%s\","
+                 "\"node_id\":%d,"
                  "\"rssi\":%d,"
-                 "\"snr\":%.1f"
+                 "\"snr\":%.1f,"
+                 "\"date\":\"%s\","
+                 "\"time\":\"%s\""
                "}"
              "}",
              safe_float(data->humidity),
@@ -503,24 +531,22 @@ void network_manager_publish_sensor_data(const lora_sensor_data_t *data)
              safe_float(data->nitrogen),
              safe_float(data->phosphorus),
              safe_float(data->potassium),
+             (strlen(s_mac_str) > 0) ? s_mac_str : "UNKNOWN",
              data->node_id,
-             s_mac_str,
              data->rssi,
-             safe_float(data->snr));
+             data->snr,
+             data->date,
+             data->time_str);
 
-    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload,
-                                         0, 1, 0);
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
+
     if (msg_id >= 0) {
-        ESP_LOGI(TAG, "MQTT publié → %s", topic);
+        ESP_LOGI(TAG, "MQTT PUBLISH OK");
+        ESP_LOGI(TAG, "  Topic   : %s", topic);
+        ESP_LOGI(TAG, "  Payload : %s", payload);
     } else {
-        ESP_LOGE(TAG, "Échec publication MQTT : %s", topic);
+        ESP_LOGE(TAG, "MQTT publish échoué");
     }
-}
-
-bool network_manager_is_connected(void)
-{
-    if (!s_wifi_event_group) return false;
-    return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
 }
 
 void network_manager_set_relay_callback(void (*callback)(int, bool))

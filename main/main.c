@@ -1,33 +1,3 @@
-/**
- * @file main.c
- * @brief Carte RÉCEPTRICE RoboCare — ESP32-S2-WROOM
- *
- * ╔════════════════════════════════════════════════════════════════════════════╗
- * ║ DIMENSIONNEMENT ÉNERGÉTIQUE (24/7 actif — critique)                       ║
- * ╠════════════════════════════════════════════════════════════════════════════╣
- * ║ Rail 3.3V : 1510 mA (ESP32=790mA, LoRa=200mA, SD=150mA, autres=370mA)    ║
- * ║ Rail 5V   : 750 mA  (Relais 5V max, SD, circuits)                        ║
- * ║ Rail 12V  : 2004 mA (15.36W total système)                               ║
- * ║                                                                            ║
- * ║ DISSIPATION THERMIQUE (CRITIQUE) :                                        ║
- * ║  • LM2596S-3.3V : P = (12V - 3.3V) × 1.51A = 13.1W                       ║
- * ║    → DOIT avoir dissipateur thermique 0.1K/W minimum                      ║
- * ║  • LM2596S-5V   : P = (12V - 5V) × 0.75A = 5.25W                        ║
- * ║    → DOIT avoir dissipateur thermique 0.5K/W minimum                      ║
- * ║                                                                            ║
- * ║ CONDENSATEURS REQUÉRANT (découplage crucial) :                            ║
- * ║  • C1 : 470µF sur 12V (entrée régulateur)                                 ║
- * ║  • C2 : 100nF sur 3.3V (ESP32 pin 2)                                     ║
- * ║  • C3 : 100nF sur 5V (ligne relais/SD)                                    ║
- * ║  • C4 : 100nF sur LoRa 3.3V                                               ║
- * ╚════════════════════════════════════════════════════════════════════════════╝
- *
- * Corrections v2.2 :
- *  1. RELAY_PINS[] : limité à 4 relais de base (extensible à 8)
- *  2. LORA_SPI_HOST = SPI3_HOST (LoRa sur bus séparé de SD)
- *  3. IO14 LED 3.3V pour indication alimentation
- *  4. Documentation énergétique complète
- */
 
 #include <stdio.h>
 #include <string.h>
@@ -66,40 +36,39 @@ static void get_device_mac(char *mac_str, size_t max_len)
 }
 
 /**
- * Lit l'UID Firebase depuis NVS
- * Retourne strdup'd string (faut free) ou NULL si non trouvé
+ * Lit l'UID Firebase depuis NVS.
+ * Retourne strdup'd string (à free()) ou NULL si non trouvé.
  */
-static char* nvs_read_uid(void)
+static char *nvs_read_uid(void)
 {
     nvs_handle_t handle;
     char uid[128] = {0};
-    
+
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
     if (ret != ESP_OK) {
         ESP_LOGI(TAG, "NVS namespace vierge — device non encore associé");
         return NULL;
     }
-    
+
     size_t len = sizeof(uid);
     ret = nvs_get_str(handle, NVS_KEY_UID, uid, &len);
     nvs_close(handle);
-    
+
     if (ret == ESP_OK && strlen(uid) > 0) {
         ESP_LOGI(TAG, "UID récupéré du NVS : %s", uid);
         return strdup(uid);
     }
-    
+
     ESP_LOGI(TAG, "UID not found in NVS");
     return NULL;
 }
 
 /**
- * ⚠️ NOTE: nvs_write_uid() a été DÉPLACÉE dans network_manager.c en tant que nvs_save_uid()
- * Raison : Elle est automatiquement appelée par network_manager quand reçoit l'UID via MQTT
- * On la supprime ici pour éviter les warnings "unused function"
- * Voir: network_manager.c::nvs_save_uid() et mqtt_event_handler::MQTT_EVENT_DATA
+ * ⚠️ NOTE: nvs_write_uid() a été DÉPLACÉE dans network_manager.c
+ * en tant que nvs_save_uid(). Elle est appelée automatiquement
+ * quand network_manager reçoit l'UID via MQTT discovery.
+ * Voir: network_manager.c::nvs_save_uid()
  */
-
 
 /* =========================================================================
  * Configuration brochage — ESP32-S2-WROOM (pinout Excel confirmé)
@@ -126,29 +95,26 @@ static char* nvs_read_uid(void)
 
 /*
  * Relais — 4 sorties de base, extensible à 8
- * Spécifications : 4 relais → 8 relais (électrovannes/pompes)
  * CORRECTION v2.2 : ordre corrigé selon pinout Excel
- *   Output1 = IO5, Output2 = IO4, Output3 = IO3, Output4 = IO2
- *   Output5 = IO6 (extension), Output6 = IO7 (extension),
- *   Output7 = IO8 (extension), Output8 = IO9 (extension)
+ *   Output1=IO5, Output2=IO4, Output3=IO3, Output4=IO2
+ *   Output5=IO6, Output6=IO7, Output7=IO8, Output8=IO9 (extension)
  */
 const int RELAY_PINS[] = { 5, 4, 3, 2, 6, 7, 8, 9 };
-#define NUM_RELAYS         4   /* 4 relais de base */
-#define MAX_RELAYS_EXTENSION 8  /* Max 8 relais avec interface complémentaire */
+#define NUM_RELAYS            4   /* 4 relais de base actifs */
+#define MAX_RELAYS_EXTENSION  8   /* Max 8 avec interface complémentaire */
 
 /* WiFi + MQTT */
-#define WIFI_SSID       "salut"
-#define WIFI_PASS       "hey0000."
-#define MQTT_SERVER     "mqtt://broker.hivemq.com"
-#define MQTT_PORT       1883
+#define WIFI_SSID    "salut"
+#define WIFI_PASS    "hey0000."
+#define MQTT_SERVER  "80.75.212.179"   /* ← string literal, corrigé v2.3 */
+#define MQTT_PORT    1883
 
 /*
- * UID Firebase — gestion automatique via NVS + discovery MQTT
- * Si pas en NVS : publie MAC sur "robocare/discovery"
- * Backend répond sur "robocare/config/<MAC>" avec l'UID
- * Possibilité de forcer un UID pour tests via network_manager_set_uid()
+ * UID Firebase — gestion automatique via NVS + discovery MQTT.
+ * g_firebase_uid[0] == '\0'  →  pas d'UID connu, mode discovery actif.
+ * g_firebase_uid[0] != '\0'  →  UID valide chargé depuis NVS.
  */
-static char g_firebase_uid[128] = {0};  /* Buffer global */
+static char g_firebase_uid[128] = {0};
 
 /* =========================================================================
  * Initialisation des bus SPI
@@ -206,7 +172,7 @@ static void led_3v3_init(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
-    gpio_set_level(LED_3V3_PIN, 1);  /* LED ON = alimentation 3.3V présente */
+    gpio_set_level(LED_3V3_PIN, 1);
     ESP_LOGI(TAG, "[LED] IO14 allumée — 3.3V OK");
 }
 
@@ -218,11 +184,11 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
     if (!data) return;
 
     ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    ESP_LOGI(TAG, "Nœud     : %d",      data->node_id);
-    ESP_LOGI(TAG, "Temp     : %.1f °C", data->temperature);
-    ESP_LOGI(TAG, "Humidité : %.1f %%", data->humidity);
+    ESP_LOGI(TAG, "Nœud     : %d",        data->node_id);
+    ESP_LOGI(TAG, "Temp     : %.1f °C",   data->temperature);
+    ESP_LOGI(TAG, "Humidité : %.1f %%",   data->humidity);
     ESP_LOGI(TAG, "EC       : %.0f µS/cm", data->ec);
-    ESP_LOGI(TAG, "pH       : %.2f%s",  data->ph,
+    ESP_LOGI(TAG, "pH       : %.2f%s",    data->ph,
              data->ph < 0 ? " (sonde déconnectée)" : "");
     ESP_LOGI(TAG, "N/P/K    : %.0f / %.0f / %.0f mg/kg",
              data->nitrogen, data->phosphorus, data->potassium);
@@ -301,10 +267,8 @@ static void lora_task(void *arg)
  * ========================================================================= */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "╔══════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║  RoboCare — Carte Réceptrice v2.3        ║");
-    ESP_LOGI(TAG, "║  ESP32-S2-WROOM + NVS + Discovery        ║");
-    ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
+    ESP_LOGI(TAG, " RoboCare — Carte Réceptrice ");
+    
 
     /* ── Initialisation NVS ──────────────────────────────────────────── */
     ESP_LOGI(TAG, "[0/7] Initialisation NVS...");
@@ -313,29 +277,38 @@ void app_main(void)
         nvs_flash_erase();
         nvs_flash_init();
     }
-    
-    /* Récupérer MAC et UID persistant */
+
+    /* Récupérer MAC pour discovery */
     char device_mac[18];
     get_device_mac(device_mac, sizeof(device_mac));
     ESP_LOGI(TAG, "  Device MAC : %s", device_mac);
-    
+
+    /*
+     * Lecture UID depuis NVS.
+     * - UID trouvé  → g_firebase_uid rempli, network_manager_set_uid() sera appelé.
+     * - UID absent  → g_firebase_uid reste vide ('\0'), mode discovery automatique.
+     *   network_manager_set_uid() N'EST PAS appelé : le network_manager
+     *   publiera lui-même la MAC sur "robocare/discovery" et attendra la réponse
+     *   du backend sur "robocare/config/<MAC>".
+     */
     char *persisted_uid = nvs_read_uid();
     if (persisted_uid) {
         strncpy(g_firebase_uid, persisted_uid, sizeof(g_firebase_uid) - 1);
+        g_firebase_uid[sizeof(g_firebase_uid) - 1] = '\0';
         free(persisted_uid);
         ESP_LOGI(TAG, "  ✓ UID du NVS : %s (ready)", g_firebase_uid);
     } else {
-        strncpy(g_firebase_uid, "AUTOMATIC_DISCOVERY", sizeof(g_firebase_uid) - 1);
+        g_firebase_uid[0] = '\0';   /* Pas d'UID — discovery en attente */
         ESP_LOGI(TAG, "  ◇ Pas d'UID en NVS → découverte automatique");
-        ESP_LOGI(TAG, "  ⏳ Le serveur doit publier l'UID sur : robocare/config/%s", device_mac);
+        ESP_LOGI(TAG, "  ⏳ Attente UID sur : robocare/config/%s", device_mac);
     }
 
-    /* ── 0/7 : LED 3.3V ──────────────────────────────────────────────── */
+    /* ── LED 3.3V ────────────────────────────────────────────────────── */
     led_3v3_init();
 
     /* ── 1/7 : Bus SPI ───────────────────────────────────────────────── */
     ESP_LOGI(TAG, "[1/7] Initialisation bus SPI...");
-    spi_sd_bus_init();    /* SPI2_HOST pour SD  (IO10-IO13) */
+    spi_sd_bus_init();    /* SPI2_HOST pour SD   (IO10-IO13) */
     spi_lora_bus_init();  /* SPI3_HOST pour LoRa (IO33-IO38) */
 
     /* ── 2/7 : SD Card ───────────────────────────────────────────────── */
@@ -348,16 +321,28 @@ void app_main(void)
     /* ── 3/7 : Relais ────────────────────────────────────────────────── */
     ESP_LOGI(TAG, "[3/7] Initialisation relais (%d zones de base, %d max)...",
              NUM_RELAYS, MAX_RELAYS_EXTENSION);
-    ESP_LOGI(TAG, "  ✓ Out1=IO5 Out2=IO4 Out3=IO3 Out4=IO2");
-    ESP_LOGI(TAG, "  ◇ Out5=IO6 Out6=IO7 Out7=IO8 Out8=IO9 (extension optional)");
+    ESP_LOGI(TAG, "  ✓ Out1=IO5  Out2=IO4  Out3=IO3  Out4=IO2");
+    ESP_LOGI(TAG, "  ◇ Out5=IO6  Out6=IO7  Out7=IO8  Out8=IO9 (extension)");
     relay_manager_init(RELAY_PINS, NUM_RELAYS);
 
     /* ── 4/7 : Réseau WiFi + MQTT ────────────────────────────────────── */
     ESP_LOGI(TAG, "[4/7] Initialisation réseau...");
-    network_manager_set_uid(g_firebase_uid);
+
+    /*
+     * CORRECTION v2.3 : network_manager_set_uid() uniquement si UID connu.
+     * Si g_firebase_uid est vide, le network_manager démarrera en mode
+     * discovery et appellera nvs_save_uid() dès réception de l'UID via MQTT.
+     */
+    if (g_firebase_uid[0] != '\0') {
+        network_manager_set_uid(g_firebase_uid);
+        ESP_LOGI(TAG, "  UID transmis au network_manager : %s", g_firebase_uid);
+    } else {
+        ESP_LOGI(TAG, "  Pas d'UID → network_manager démarre en mode discovery");
+    }
+
     network_manager_init(WIFI_SSID, WIFI_PASS, MQTT_SERVER, MQTT_PORT);
     network_manager_set_relay_callback(on_relay_command_received);
-    network_manager_start();  /* Bloquant jusqu'à WiFi connexion */
+    network_manager_start();  /* Bloquant jusqu'à connexion WiFi */
 
     /* ── 5/7 : LoRa ──────────────────────────────────────────────────── */
     ESP_LOGI(TAG, "[5/7] Initialisation LoRa (CS=IO%d RST=IO%d DIO0=IO%d)...",
@@ -374,7 +359,7 @@ void app_main(void)
     ESP_LOGI(TAG, "[6/7] Démarrage tâche LoRa...");
     xTaskCreate(lora_task, "lora_task", 4096, NULL, 5, NULL);
 
-    /* ── 7/7 : Résumé ────────────────────────────────────────────────── */
+    /* ── 7/7 : Résumé système ────────────────────────────────────────── */
     ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     ESP_LOGI(TAG, "PROFIL ÉNERGÉTIQUE 24/7 ACTIF");
     ESP_LOGI(TAG, "  3.3V : 1510 mA | 5V : 750 mA | 12V : 2004 mA (15.36W)");
@@ -382,8 +367,8 @@ void app_main(void)
     ESP_LOGI(TAG, "  ⚠️  Dissipateurs LM2596S ESSENTIELS");
     ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     ESP_LOGI(TAG, "CONFIGURATION MQTT + NVS");
-    if (strcmp(g_firebase_uid, "AUTOMATIC_DISCOVERY") == 0) {
-        ESP_LOGI(TAG, "  ⏳ ATTENTE UID : Bridge publiera sur robocare/config/%s", device_mac);
+    if (g_firebase_uid[0] == '\0') {
+        ESP_LOGI(TAG, "  ⏳ ATTENTE UID : bridge → robocare/config/%s", device_mac);
     } else {
         ESP_LOGI(TAG, "  ✓ UID ACTIF : %s", g_firebase_uid);
     }
