@@ -13,5 +13,6 @@
     "--query-driver=**",
     "--compile-commands-dir=d:\\PFE APP\\esp_projects\\robocare_gateway\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.portWin": "COM9"
 }

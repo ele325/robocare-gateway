@@ -12,7 +12,6 @@
         "${workspaceFolder}/components/relay_manager/include",
         "${workspaceFolder}/**",
         "${workspaceFolder}/build/**",
-        "${workspaceFolder}/components/ble_provisioning_manager/include",
         "C:/Espressif/frameworks/esp-idf-v5.3.1/components/**",
         "C:/Espressif/frameworks/esp-idf-v5.3.1/components/driver/deprecated",
         "C:/Espressif/frameworks/esp-idf-v5.3.1/components/esp_wifi/include",
