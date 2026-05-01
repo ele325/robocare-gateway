@@ -44,6 +44,16 @@ static esp_timer_handle_t s_wifi_reconnect_timer = NULL;
 
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 
+/* ═══════════════════════════════════════════════════════════
+ * Index fixes des relais — correspondent à main.c
+ * PUMP_RELAY_INDEX  = 2  (OUTPUT3 / IO3)
+ * VALVE_RELAY_INDEX = 3  (OUTPUT4 / IO2)
+ * ═══════════════════════════════════════════════════════════ */
+#define PUMP_RELAY_INDEX   2
+#define VALVE_RELAY_INDEX  3
+
+/* ─────────────────────────────────────────────────────────── */
+
 static void wifi_reconnect_timer_cb(void *arg)
 {
     (void)arg;
@@ -55,10 +65,10 @@ static void schedule_wifi_reconnect(void)
 {
     if (!s_wifi_reconnect_timer) {
         const esp_timer_create_args_t timer_args = {
-            .callback = wifi_reconnect_timer_cb,
-            .arg = NULL,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "wifi_reconnect",
+            .callback              = wifi_reconnect_timer_cb,
+            .arg                   = NULL,
+            .dispatch_method       = ESP_TIMER_TASK,
+            .name                  = "wifi_reconnect",
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_wifi_reconnect_timer));
@@ -148,7 +158,8 @@ static void subscribe_config_topic(void)
     if (!s_mqtt_client || strlen(s_mac_str) == 0) return;
 
     char config_topic[64];
-    snprintf(config_topic, sizeof(config_topic), "robocare/config/%s", s_mac_str);
+    snprintf(config_topic, sizeof(config_topic),
+             "robocare/config/%s", s_mac_str);
 
     esp_mqtt_client_subscribe(s_mqtt_client, config_topic, 1);
     ESP_LOGI(TAG, "Subscribe config : %s", config_topic);
@@ -158,11 +169,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     (void)arg;
-    (void)event_data;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         s_reconnect_count++;
 
@@ -174,11 +186,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         if (s_reconnect_delay_ms > WIFI_RECONNECT_DELAY_MS_MAX) {
             s_reconnect_delay_ms = WIFI_RECONNECT_DELAY_MS_MAX;
         }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi OK - IP : " IPSTR, IP2STR(&event->ip_info.ip));
 
-        if (s_wifi_reconnect_timer && esp_timer_is_active(s_wifi_reconnect_timer)) {
+    } else if (event_base == IP_EVENT &&
+               event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "WiFi OK - IP : " IPSTR,
+                 IP2STR(&event->ip_info.ip));
+
+        if (s_wifi_reconnect_timer &&
+            esp_timer_is_active(s_wifi_reconnect_timer)) {
             ESP_ERROR_CHECK(esp_timer_stop(s_wifi_reconnect_timer));
         }
         s_reconnect_delay_ms = WIFI_RECONNECT_DELAY_MS_INIT;
@@ -192,9 +208,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 {
     (void)handler_args;
     (void)base;
-    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    esp_mqtt_event_handle_t event =
+        (esp_mqtt_event_handle_t)event_data;
 
     switch ((esp_mqtt_event_id_t)event_id) {
+
+        /* ── CONNECTÉ ────────────────────────────────────── */
         case MQTT_EVENT_CONNECTED: {
             ESP_LOGI(TAG, "MQTT connecte au broker");
 
@@ -204,31 +223,36 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
 
             if (s_uid_received && strlen(s_uid) > 0) {
+                /* Subscribe valve */
                 char sub_topic[96];
                 snprintf(sub_topic, sizeof(sub_topic),
                          "robocare/%s/valve/control/+", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
                 ESP_LOGI(TAG, "Subscribe valve : %s", sub_topic);
 
+                /* Subscribe pump */
                 char pump_topic[96];
                 snprintf(pump_topic, sizeof(pump_topic),
                          "robocare/%s/pump/control", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, pump_topic, 1);
                 ESP_LOGI(TAG, "Subscribe pump : %s", pump_topic);
+
             } else if (!s_uid_fixed) {
                 ESP_LOGW(TAG, "UID non recu - commandes relais desactivees");
             }
             break;
         }
 
+        /* ── DÉCONNECTÉ ──────────────────────────────────── */
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT deconnecte - reconnexion automatique");
             break;
 
+        /* ── MESSAGE REÇU ────────────────────────────────── */
         case MQTT_EVENT_DATA: {
             if (!event->topic || !event->data) break;
 
-            char topic[128] = {0};
+            char topic[128]   = {0};
             char payload[128] = {0};
 
             if (event->topic_len < (int)sizeof(topic)) {
@@ -238,19 +262,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 memcpy(payload, event->data, event->data_len);
             }
 
-            ESP_LOGD(TAG, "MQTT RX [%s] : %s", topic, payload);
+            ESP_LOGI(TAG, "MQTT RX [%s] : %s", topic, payload);
 
+            /* ── Config UID ── */
             if (!s_uid_fixed) {
                 char config_prefix[64];
                 snprintf(config_prefix, sizeof(config_prefix),
                          "robocare/config/%s", s_mac_str);
 
-                if (strncmp(topic, config_prefix, strlen(config_prefix)) == 0) {
-                    if (strlen(payload) > 0 && strlen(payload) < UID_MAX_LEN) {
+                if (strncmp(topic, config_prefix,
+                            strlen(config_prefix)) == 0) {
+                    if (strlen(payload) > 0 &&
+                        strlen(payload) < UID_MAX_LEN) {
                         strncpy(s_uid, payload, UID_MAX_LEN - 1);
                         s_uid[UID_MAX_LEN - 1] = '\0';
                         s_uid_received = true;
-
                         ESP_LOGI(TAG, "UID recu depuis bridge : %s", s_uid);
                         nvs_save_uid(s_uid);
                     }
@@ -258,9 +284,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 }
             }
 
+            /* ── Découpage topic ── */
             char *parts[6] = {NULL};
-            int np = 0;
-            char topic_copy[128] = {0};
+            int   np       = 0;
+            char  topic_copy[128] = {0};
             strncpy(topic_copy, topic, sizeof(topic_copy) - 1);
             char *tok = strtok(topic_copy, "/");
             while (tok && np < 6) {
@@ -268,23 +295,51 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 tok = strtok(NULL, "/");
             }
 
-            if (np >= 5 && parts[2] && strcmp(parts[2], "valve") == 0) {
-                if (!s_relay_callback) break;
-                int zone_id = atoi(parts[4]);
-                if (zone_id < 1 || zone_id > 12) break;
+            if (!s_relay_callback) {
+                ESP_LOGW(TAG, "Callback relais non enregistre");
+                break;
+            }
+
+            /* ════════════════════════════════════════════════
+             * VANNE — robocare/{uid}/valve/control/{zone}
+             * ✅ CORRIGÉ : index fixe VALVE_RELAY_INDEX=3
+             *    au lieu de zone_id-1 qui pointait
+             *    vers le mauvais relais
+             * ════════════════════════════════════════════════ */
+            if (np >= 5 &&
+                parts[2] && strcmp(parts[2], "valve") == 0 &&
+                parts[3] && strcmp(parts[3], "control") == 0) {
+
                 bool state = (strcmp(payload, "1") == 0);
-                ESP_LOGI(TAG, "Commande vanne zone %d -> %s",
-                         zone_id, state ? "ON" : "OFF");
-                s_relay_callback(zone_id - 1, state);
-            } else if (np >= 4 && parts[2] && strcmp(parts[2], "pump") == 0) {
-                ESP_LOGI(TAG, "Commande pompe -> %s",
-                         (strcmp(payload, "1") == 0) ? "ON" : "OFF");
+
+                ESP_LOGI(TAG, "Commande VANNE → %s (relay_idx=%d IO2)",
+                         state ? "ON" : "OFF", VALVE_RELAY_INDEX);
+
+                s_relay_callback(VALVE_RELAY_INDEX, state);
+
+            /* ════════════════════════════════════════════════
+             * POMPE — robocare/{uid}/pump/control
+             * ✅ CORRIGÉ : index fixe PUMP_RELAY_INDEX=2
+             * ════════════════════════════════════════════════ */
+            } else if (np >= 4 &&
+                       parts[2] && strcmp(parts[2], "pump") == 0 &&
+                       parts[3] && strcmp(parts[3], "control") == 0) {
+
+                bool state = (strcmp(payload, "1") == 0);
+
+                ESP_LOGI(TAG, "Commande POMPE → %s (relay_idx=%d IO3)",
+                         state ? "ON" : "OFF", PUMP_RELAY_INDEX);
+
+                s_relay_callback(PUMP_RELAY_INDEX, state);
+
             } else {
                 ESP_LOGD(TAG, "Topic non gere : %s", topic);
             }
+
             break;
         }
 
+        /* ── ERREUR ──────────────────────────────────────── */
         case MQTT_EVENT_ERROR:
             ESP_LOGE(TAG, "Erreur MQTT");
             break;
@@ -294,6 +349,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     }
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * API publique
+ * ═══════════════════════════════════════════════════════════ */
+
 void network_manager_set_uid(const char *uid)
 {
     if (!uid || strlen(uid) == 0) return;
@@ -301,7 +360,7 @@ void network_manager_set_uid(const char *uid)
     strncpy(s_uid, uid, UID_MAX_LEN - 1);
     s_uid[UID_MAX_LEN - 1] = '\0';
     s_uid_received = true;
-    s_uid_fixed = true;
+    s_uid_fixed    = true;
     nvs_save_uid(s_uid);
     ESP_LOGI(TAG, "UID fixe configure : %s", s_uid);
 }
@@ -329,9 +388,11 @@ void network_manager_init(const char *ssid, const char *password,
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+        WIFI_EVENT, ESP_EVENT_ANY_ID,
+        &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+        IP_EVENT, IP_EVENT_STA_GOT_IP,
+        &wifi_event_handler, NULL, NULL));
 
     wifi_config_t wifi_config = {
         .sta = {
@@ -340,7 +401,8 @@ void network_manager_init(const char *ssid, const char *password,
             .pmf_cfg.required   = false,
         },
     };
-    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.ssid, ssid,
+            sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, password,
             sizeof(wifi_config.sta.password) - 1);
 
@@ -362,7 +424,8 @@ void network_manager_init(const char *ssid, const char *password,
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID,
                                    mqtt_event_handler, NULL);
 
-    ESP_LOGI(TAG, "Network manager initialise - SSID: %s Broker: %s:%d",
+    ESP_LOGI(TAG,
+             "Network manager initialise - SSID: %s Broker: %s:%d",
              ssid, mqtt_server, mqtt_port);
 }
 
@@ -453,7 +516,8 @@ void network_manager_publish_sensor_data(const lora_sensor_data_t *data)
              data->date,
              data->time_str);
 
-    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
+    int msg_id = esp_mqtt_client_publish(
+        s_mqtt_client, topic, payload, 0, 1, 0);
 
     if (msg_id >= 0) {
         ESP_LOGI(TAG, "MQTT PUBLISH OK");
@@ -486,9 +550,7 @@ bool network_manager_is_provisioned(void)
 
 bool network_manager_is_connected(void)
 {
-    if (!s_wifi_event_group) {
-        return false;
-    }
+    if (!s_wifi_event_group) return false;
 
     EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
     return (bits & WIFI_CONNECTED_BIT) != 0;

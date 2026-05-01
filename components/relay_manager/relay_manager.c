@@ -2,7 +2,7 @@
  * @file relay_manager.c
  * @brief Gestionnaire relais — Carte RÉCEPTRICE RoboCare (ESP32-S2-WROOM)
  *
- * Corrections appliquées (v1.0 → v1.3) :
+ * Corrections appliquées (v1.0 → v1.4) :
  *
  *  v1.1 [CRITIQUE]   malloc() vérifié — return si heap insuffisante.
  *  v1.1 [CRITIQUE]   Guard double-init : free() avant réallocation.
@@ -11,6 +11,10 @@
  *  v1.3 [ROBUSTESSE] Mutex FreeRTOS pour thread-safety (tâche LoRa + MQTT).
  *  v1.3 [ROBUSTESSE] Copie interne des pins (évite dangling pointer).
  *  v1.3 [AJOUT]      relay_manager_deinit() pour nettoyage propre.
+ *  v1.4 [CRITIQUE]   Logique inversée : relais ACTIF LOW
+ *                    → ON  = gpio_set_level(pin, 0)
+ *                    → OFF = gpio_set_level(pin, 1)
+ *                    → Init GPIO à HIGH (relais éteint au démarrage)
  */
 
 #include "relay_manager.h"
@@ -48,6 +52,25 @@ static SemaphoreHandle_t s_mutex = NULL;
  * ╚════════════════════════════════════════════════════════════════════╝
  */
 #define RELAY_MAX_ACTIVE  4
+
+/*
+ * ╔════════════════════════════════════════════════════════════════════╗
+ * ║ LOGIQUE ACTIF LOW                                                 ║
+ * ╠════════════════════════════════════════════════════════════════════╣
+ * ║ Circuit : ESP32-S2 GPIO → PC817 optocoupleur → BC547 → relais    ║
+ * ║                                                                   ║
+ * ║ GPIO LOW  (0) → courant dans PC817 → transistor saturé           ║
+ * ║               → bobine alimentée → relais ON  ✓                  ║
+ * ║                                                                   ║
+ * ║ GPIO HIGH (1) → pas de courant → transistor bloqué               ║
+ * ║               → bobine coupée  → relais OFF ✓                    ║
+ * ║                                                                   ║
+ * ║ RELAY_ACTIVE_LEVEL  = 0  (LOW  = ON)                             ║
+ * ║ RELAY_INACTIVE_LEVEL= 1  (HIGH = OFF)                            ║
+ * ╚════════════════════════════════════════════════════════════════════╝
+ */
+#define RELAY_ACTIVE_LEVEL    0   /* GPIO LOW  = relais ON  */
+#define RELAY_INACTIVE_LEVEL  1   /* GPIO HIGH = relais OFF */
 
 /* =========================================================================
  * API publique
@@ -107,7 +130,7 @@ void relay_manager_init(const int *pins, int num_pins)
     }
     memset(s_relay_states, 0, s_num_relays * sizeof(bool));
 
-    /* Configuration GPIO via gpio_config() — méthode recommandée ESP-IDF */
+    /* Configuration GPIO — HIGH au démarrage = relais OFF (actif LOW) */
     for (int i = 0; i < s_num_relays; i++) {
         gpio_config_t io_conf = {
             .pin_bit_mask = (1ULL << s_relay_pins[i]),
@@ -117,12 +140,13 @@ void relay_manager_init(const int *pins, int num_pins)
             .intr_type    = GPIO_INTR_DISABLE,
         };
         gpio_config(&io_conf);
-        gpio_set_level(s_relay_pins[i], 0);  /* OFF au démarrage */
+        /* ✅ CORRIGÉ : HIGH = relais OFF (logique actif LOW) */
+        gpio_set_level(s_relay_pins[i], RELAY_INACTIVE_LEVEL);
     }
 
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "Initialisé : %d relais", s_num_relays);
+    ESP_LOGI(TAG, "Initialisé : %d relais (logique actif LOW)", s_num_relays);
     for (int i = 0; i < s_num_relays; i++) {
         ESP_LOGI(TAG, "  Relais %d → IO%d", i + 1, s_relay_pins[i]);
     }
@@ -157,12 +181,12 @@ void relay_manager_set(int index, bool state)
     }
 
     /*
-     * Logique GPIO → relais :
-     * Circuit : ESP32-S2 GPIO → PC817 optocoupleur → BC547 → bobine relais 12V
-     * GPIO HIGH (1) = courant dans PC817 = transistor saturé = relais ON
-     * Si inverse → remplacer state ? 1 : 0  par  state ? 0 : 1
+     * ✅ CORRIGÉ : Logique actif LOW
+     * state=true  (ON)  → GPIO LOW  (0) → relais s'active
+     * state=false (OFF) → GPIO HIGH (1) → relais se désactive
      */
-    gpio_set_level(s_relay_pins[index], state ? 1 : 0);
+    gpio_set_level(s_relay_pins[index],
+                   state ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
     s_relay_states[index] = state;
 
     /* Compter actifs pour le log */
@@ -210,10 +234,10 @@ void relay_manager_deinit(void)
         xSemaphoreTake(s_mutex, portMAX_DELAY);
     }
 
-    /* Éteindre tous les relais */
+    /* Éteindre tous les relais (HIGH = OFF en actif LOW) */
     if (s_relay_pins && s_relay_states) {
         for (int i = 0; i < s_num_relays; i++) {
-            gpio_set_level(s_relay_pins[i], 0);
+            gpio_set_level(s_relay_pins[i], RELAY_INACTIVE_LEVEL);
         }
     }
 
