@@ -13,7 +13,7 @@ void relay_manager_init(const int *pins, int num_pins);
 
 /**
  * @brief Active ou désactive un relais
- * @param index Index du relais (0-11)
+ * @param index Index du relais (0..num_pins-1)
  * @param state true = ON, false = OFF
  */
 void relay_manager_set(int index, bool state);
@@ -30,5 +30,22 @@ bool relay_manager_get(int index);
  * @return Nombre de relais allumés
  */
 int relay_manager_active_count(void);
+
+/**
+ * @brief Niveau logique utilisé pour activer un relais.
+ * @return 0 ou 1 (en fonction du câblage actif LOW/HIGH)
+ */
+int relay_manager_active_level(void);
+
+/**
+ * @brief Niveau logique utilisé pour désactiver un relais.
+ * @return 0 ou 1 (en fonction du câblage actif LOW/HIGH)
+ */
+int relay_manager_inactive_level(void);
+
+/**
+ * @brief Éteint tous les relais et libère les ressources.
+ */
+void relay_manager_deinit(void);
 
 #endif // RELAY_MANAGER_H

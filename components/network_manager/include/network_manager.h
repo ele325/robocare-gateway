@@ -55,13 +55,39 @@ void network_manager_start(void);
  * Publication annulée si UID pas encore reçu.
  */
 void network_manager_publish_sensor_data(const lora_sensor_data_t *data);
+void network_manager_publish_irrigation_status(int zone, const char *status);
+
+/**
+ * @brief Publie l'état d'un relais sur MQTT (pour mise à jour UI mobile).
+ * Pompe  : robocare/{uid}/pump/control  → "0" ou "1"
+ * Vanne  : robocare/{uid}/valve/control/{zone} → "0" ou "1"
+ */
+void network_manager_publish_relay_state(bool pump, bool valve);
+
+typedef void (*network_manager_relay_cb_t)(int, bool);
+typedef void (*network_manager_mode_cb_t)(bool);
+typedef void (*network_manager_timed_irrigation_cb_t)(int zone, int seconds);
 
 /**
  * @brief Enregistre le callback pour les commandes relais MQTT.
  * Appelé quand bridge publie : robocare/<uid>/valve/control/<zone>
  * @param callback fonction(relay_index 0-11, state ON/OFF)
  */
-void network_manager_set_relay_callback(void (*callback)(int, bool));
+void network_manager_set_relay_callback(network_manager_relay_cb_t cb);
+
+/**
+ * @brief Enregistre le callback pour le changement de mode AUTO/MANUEL.
+ * Appelé quand MQTT reçoit : robocare/<uid>/mode/control
+ * Payload : "auto" → true  |  "manual" → false
+ * @param callback fonction(auto_mode : true=AUTO, false=MANUEL)
+ */
+void network_manager_set_mode_callback(network_manager_mode_cb_t cb);
+
+/**
+ * @brief Enregistre le callback pour l'irrigation temporisée.
+ * @param callback fonction(seconds)
+ */
+void network_manager_set_timed_irrigation_callback(network_manager_timed_irrigation_cb_t cb);
 
 /**
  * @brief Retourne true si WiFi connecté et IP obtenue.

@@ -22,7 +22,11 @@ static const char *TAG = "NETWORK";
 
 static EventGroupHandle_t       s_wifi_event_group = NULL;
 static esp_mqtt_client_handle_t s_mqtt_client      = NULL;
-static void (*s_relay_callback)(int, bool)         = NULL;
+
+/* Callbacks */
+static network_manager_relay_cb_t            s_relay_callback            = NULL;
+static network_manager_mode_cb_t             s_mode_callback             = NULL;
+static network_manager_timed_irrigation_cb_t s_timed_irrigation_callback = NULL;
 
 #define UID_MAX_LEN  64
 #define NVS_NS       "robocare"
@@ -44,15 +48,7 @@ static esp_timer_handle_t s_wifi_reconnect_timer = NULL;
 
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 
-/* ═══════════════════════════════════════════════════════════
- * Index fixes des relais — correspondent à main.c
- * PUMP_RELAY_INDEX  = 2  (OUTPUT3 / IO3)
- * VALVE_RELAY_INDEX = 3  (OUTPUT4 / IO2)
- * ═══════════════════════════════════════════════════════════ */
-#define PUMP_RELAY_INDEX   2
-#define VALVE_RELAY_INDEX  3
-
-/* ─────────────────────────────────────────────────────────── */
+/* ── Helpers ─────────────────────────────────────────────────────────── */
 
 static void wifi_reconnect_timer_cb(void *arg)
 {
@@ -125,7 +121,6 @@ static void nvs_save_uid(const char *uid)
 static float safe_float(float value)
 {
     if (isnan(value) || isinf(value)) {
-        ESP_LOGW(TAG, "Flottant invalide detecte NaN/Inf -> 0.0");
         return 0.0f;
     }
     return value;
@@ -138,7 +133,37 @@ static void read_mac_address(void)
     snprintf(s_mac_str, sizeof(s_mac_str),
              "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "MAC address : %s", s_mac_str);
+}
+
+/* ── MQTT Actions ────────────────────────────────────────────────────── */
+
+void network_manager_publish_irrigation_status(int zone, const char *status)
+{
+    if (!s_mqtt_client || !s_uid_received) return;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "robocare/%s/zone/%d/irrigation/status", s_uid, zone);
+
+    esp_mqtt_client_publish(s_mqtt_client, topic, status, 0, 1, 0);
+    ESP_LOGI(TAG, "Statut irrigation publié [%s]: %s", topic, status);
+}
+
+void network_manager_publish_relay_state(bool pump, bool valve)
+{
+    if (!s_mqtt_client || !s_uid_received) return;
+
+    char topic_pump[128];
+    char topic_valve[128];
+    
+    /* Assuming zone 1 for the automatic valve update for now. 
+       In a multi-zone setup, we'd need to know which zone to update. */
+    snprintf(topic_pump, sizeof(topic_pump), "robocare/%s/pump/control", s_uid);
+    snprintf(topic_valve, sizeof(topic_valve), "robocare/%s/valve/control/1", s_uid);
+
+    esp_mqtt_client_publish(s_mqtt_client, topic_pump, pump ? "1" : "0", 0, 1, 0);
+    esp_mqtt_client_publish(s_mqtt_client, topic_valve, valve ? "1" : "0", 0, 1, 0);
+    
+    ESP_LOGI(TAG, "Etats relais publies - Pompe: %d, Vanne: %d", pump, valve);
 }
 
 static void publish_discovery(void)
@@ -165,38 +190,20 @@ static void subscribe_config_topic(void)
     ESP_LOGI(TAG, "Subscribe config : %s", config_topic);
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
-{
-    (void)arg;
+/* ── Handlers ────────────────────────────────────────────────────────── */
 
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                int32_t event_id, void *event_data)
+{
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-
-    } else if (event_base == WIFI_EVENT &&
-               event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         s_reconnect_count++;
-
-        ESP_LOGW(TAG, "WiFi deconnecte (#%d) - attente %" PRIu32 "ms",
-                 s_reconnect_count, s_reconnect_delay_ms);
-
         schedule_wifi_reconnect();
-        s_reconnect_delay_ms *= 2;
-        if (s_reconnect_delay_ms > WIFI_RECONNECT_DELAY_MS_MAX) {
-            s_reconnect_delay_ms = WIFI_RECONNECT_DELAY_MS_MAX;
-        }
-
-    } else if (event_base == IP_EVENT &&
-               event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi OK - IP : " IPSTR,
-                 IP2STR(&event->ip_info.ip));
-
-        if (s_wifi_reconnect_timer &&
-            esp_timer_is_active(s_wifi_reconnect_timer)) {
-            ESP_ERROR_CHECK(esp_timer_stop(s_wifi_reconnect_timer));
-        }
+        s_reconnect_delay_ms = (s_reconnect_delay_ms * 2 < WIFI_RECONNECT_DELAY_MS_MAX) ? 
+                                s_reconnect_delay_ms * 2 : WIFI_RECONNECT_DELAY_MS_MAX;
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         s_reconnect_delay_ms = WIFI_RECONNECT_DELAY_MS_INIT;
         s_reconnect_count    = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -206,180 +213,88 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
-    (void)handler_args;
-    (void)base;
-    esp_mqtt_event_handle_t event =
-        (esp_mqtt_event_handle_t)event_data;
-
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
-
-        /* ── CONNECTÉ ────────────────────────────────────── */
-        case MQTT_EVENT_CONNECTED: {
-            ESP_LOGI(TAG, "MQTT connecte au broker");
-
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connecte");
             if (!s_uid_fixed) {
                 subscribe_config_topic();
                 publish_discovery();
             }
-
             if (s_uid_received && strlen(s_uid) > 0) {
-                /* Subscribe valve */
-                char sub_topic[96];
-                snprintf(sub_topic, sizeof(sub_topic),
-                         "robocare/%s/valve/control/+", s_uid);
+                char sub_topic[128];
+                /* Valve control */
+                snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/valve/control/+", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
-                ESP_LOGI(TAG, "Subscribe valve : %s", sub_topic);
-
-                /* Subscribe pump */
-                char pump_topic[96];
-                snprintf(pump_topic, sizeof(pump_topic),
-                         "robocare/%s/pump/control", s_uid);
-                esp_mqtt_client_subscribe(s_mqtt_client, pump_topic, 1);
-                ESP_LOGI(TAG, "Subscribe pump : %s", pump_topic);
-
-            } else if (!s_uid_fixed) {
-                ESP_LOGW(TAG, "UID non recu - commandes relais desactivees");
+                /* Pump control */
+                snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/pump/control", s_uid);
+                esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
+                /* Mode control */
+                snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/mode/control", s_uid);
+                esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
+                /* Timed irrigation */
+                snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/irrigation/timed/+", s_uid);
+                esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
             }
             break;
-        }
 
-        /* ── DÉCONNECTÉ ──────────────────────────────────── */
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "MQTT deconnecte - reconnexion automatique");
-            break;
-
-        /* ── MESSAGE REÇU ────────────────────────────────── */
         case MQTT_EVENT_DATA: {
             if (!event->topic || !event->data) break;
-
-            char topic[128]   = {0};
+            char topic[128] = {0};
             char payload[128] = {0};
-
-            if (event->topic_len < (int)sizeof(topic)) {
-                memcpy(topic, event->topic, event->topic_len);
-            }
-            if (event->data_len < (int)sizeof(payload)) {
-                memcpy(payload, event->data, event->data_len);
-            }
+            memcpy(topic, event->topic, event->topic_len < 127 ? event->topic_len : 127);
+            memcpy(payload, event->data, event->data_len < 127 ? event->data_len : 127);
 
             ESP_LOGI(TAG, "MQTT RX [%s] : %s", topic, payload);
 
-            /* ── Config UID ── */
-            if (!s_uid_fixed) {
-                char config_prefix[64];
-                snprintf(config_prefix, sizeof(config_prefix),
-                         "robocare/config/%s", s_mac_str);
+            /* Parse topic */
+            char *parts[6] = {NULL};
+            int np = 0;
+            char topic_copy[128] = {0};
+            strncpy(topic_copy, topic, 127);
+            char *tok = strtok(topic_copy, "/");
+            while (tok && np < 6) { parts[np++] = tok; tok = strtok(NULL, "/"); }
 
-                if (strncmp(topic, config_prefix,
-                            strlen(config_prefix)) == 0) {
-                    if (strlen(payload) > 0 &&
-                        strlen(payload) < UID_MAX_LEN) {
-                        strncpy(s_uid, payload, UID_MAX_LEN - 1);
-                        s_uid[UID_MAX_LEN - 1] = '\0';
-                        s_uid_received = true;
-                        ESP_LOGI(TAG, "UID recu depuis bridge : %s", s_uid);
-                        nvs_save_uid(s_uid);
-                    }
-                    break;
+            /* UID config */
+            if (!s_uid_fixed && np >= 3 && strcmp(parts[1], "config") == 0) {
+                if (strcmp(parts[2], s_mac_str) == 0) {
+                    strncpy(s_uid, payload, UID_MAX_LEN - 1);
+                    s_uid_received = true;
+                    nvs_save_uid(s_uid);
+                    esp_restart(); // Restart to subscribe to new topics
                 }
             }
 
-            /* ── Découpage topic ── */
-            char *parts[6] = {NULL};
-            int   np       = 0;
-            char  topic_copy[128] = {0};
-            strncpy(topic_copy, topic, sizeof(topic_copy) - 1);
-            char *tok = strtok(topic_copy, "/");
-            while (tok && np < 6) {
-                parts[np++] = tok;
-                tok = strtok(NULL, "/");
+            /* Commands */
+            if (!s_uid_received) break;
+
+            if (np >= 4 && strcmp(parts[2], "mode") == 0) {
+                if (s_mode_callback) s_mode_callback(strcmp(payload, "auto") == 0);
+            } 
+            else if (np >= 4 && strcmp(parts[2], "pump") == 0) {
+                if (s_relay_callback) s_relay_callback(2, strcmp(payload, "1") == 0); // PUMP_RELAY_INDEX = 2
+            } 
+            else if (np >= 5 && strcmp(parts[2], "valve") == 0) {
+                if (s_relay_callback) s_relay_callback(3, strcmp(payload, "1") == 0); // VALVE_RELAY_INDEX = 3
             }
-
-            if (!s_relay_callback) {
-                ESP_LOGW(TAG, "Callback relais non enregistre");
-                break;
+            else if (np >= 5 && strcmp(parts[2], "irrigation") == 0 && strcmp(parts[3], "timed") == 0) {
+                if (s_timed_irrigation_callback) {
+                    int zone = atoi(parts[4]);
+                    s_timed_irrigation_callback(zone, atoi(payload));
+                }
             }
-
-            /* ════════════════════════════════════════════════
-             * VANNE — robocare/{uid}/valve/control/{zone}
-             * ✅ CORRIGÉ : index fixe VALVE_RELAY_INDEX=3
-             *    au lieu de zone_id-1 qui pointait
-             *    vers le mauvais relais
-             * ════════════════════════════════════════════════ */
-            if (np >= 5 &&
-                parts[2] && strcmp(parts[2], "valve") == 0 &&
-                parts[3] && strcmp(parts[3], "control") == 0) {
-
-                bool state = (strcmp(payload, "1") == 0);
-
-                ESP_LOGI(TAG, "Commande VANNE → %s (relay_idx=%d IO2)",
-                         state ? "ON" : "OFF", VALVE_RELAY_INDEX);
-
-                s_relay_callback(VALVE_RELAY_INDEX, state);
-
-            /* ════════════════════════════════════════════════
-             * POMPE — robocare/{uid}/pump/control
-             * ✅ CORRIGÉ : index fixe PUMP_RELAY_INDEX=2
-             * ════════════════════════════════════════════════ */
-            } else if (np >= 4 &&
-                       parts[2] && strcmp(parts[2], "pump") == 0 &&
-                       parts[3] && strcmp(parts[3], "control") == 0) {
-
-                bool state = (strcmp(payload, "1") == 0);
-
-                ESP_LOGI(TAG, "Commande POMPE → %s (relay_idx=%d IO3)",
-                         state ? "ON" : "OFF", PUMP_RELAY_INDEX);
-
-                s_relay_callback(PUMP_RELAY_INDEX, state);
-
-            } else {
-                ESP_LOGD(TAG, "Topic non gere : %s", topic);
-            }
-
             break;
         }
-
-        /* ── ERREUR ──────────────────────────────────────── */
-        case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "Erreur MQTT");
-            break;
-
-        default:
-            break;
+        default: break;
     }
 }
 
-/* ═══════════════════════════════════════════════════════════
- * API publique
- * ═══════════════════════════════════════════════════════════ */
-
-void network_manager_set_uid(const char *uid)
-{
-    if (!uid || strlen(uid) == 0) return;
-
-    strncpy(s_uid, uid, UID_MAX_LEN - 1);
-    s_uid[UID_MAX_LEN - 1] = '\0';
-    s_uid_received = true;
-    s_uid_fixed    = true;
-    nvs_save_uid(s_uid);
-    ESP_LOGI(TAG, "UID fixe configure : %s", s_uid);
-}
+/* ── Public API ──────────────────────────────────────────────────────── */
 
 void network_manager_init(const char *ssid, const char *password,
                           const char *mqtt_server, int mqtt_port)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    nvs_load_uid();
-
     s_wifi_event_group = xEventGroupCreate();
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -387,171 +302,60 @@ void network_manager_init(const char *ssid, const char *password,
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID,
-        &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP,
-        &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .pmf_cfg.capable    = true,
-            .pmf_cfg.required   = false,
-        },
-    };
-    strncpy((char *)wifi_config.sta.ssid, ssid,
-            sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, password,
-            sizeof(wifi_config.sta.password) - 1);
+    wifi_config_t wifi_config = { .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK } };
+    strncpy((char *)wifi_config.sta.ssid, ssid, 31);
+    strncpy((char *)wifi_config.sta.password, password, 63);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri  = mqtt_server,
-        .broker.address.port = (uint32_t)mqtt_port,
-        .session.keepalive   = 60,
+        .broker.address.uri = mqtt_server,
+        .broker.address.port = mqtt_port,
     };
-
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    if (!s_mqtt_client) {
-        ESP_LOGE(TAG, "esp_mqtt_client_init echoue");
-        return;
-    }
-
-    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID,
-                                   mqtt_event_handler, NULL);
-
-    ESP_LOGI(TAG,
-             "Network manager initialise - SSID: %s Broker: %s:%d",
-             ssid, mqtt_server, mqtt_port);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    
+    nvs_load_uid();
 }
 
 void network_manager_start(void)
 {
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Attente connexion WiFi (timeout %ds)...",
-             WIFI_CONNECT_TIMEOUT_MS / 1000);
-
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group,
-        WIFI_CONNECTED_BIT,
-        pdFALSE, pdFALSE,
-        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        read_mac_address();
-        ESP_LOGI(TAG, "WiFi OK - demarrage client MQTT");
-        if (s_mqtt_client) {
-            esp_mqtt_client_start(s_mqtt_client);
-        }
-    } else {
-        ESP_LOGE(TAG, "Timeout WiFi (%ds) - MQTT non demarre",
-                 WIFI_CONNECT_TIMEOUT_MS / 1000);
-    }
+    esp_wifi_start();
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    read_mac_address();
+    if (s_mqtt_client) esp_mqtt_client_start(s_mqtt_client);
 }
 
 void network_manager_publish_sensor_data(const lora_sensor_data_t *data)
 {
-    if (!data) {
-        ESP_LOGW(TAG, "network_manager_publish_sensor_data: data=NULL");
-        return;
-    }
-
-    if (!s_mqtt_client) {
-        ESP_LOGW(TAG, "MQTT client non initialise");
-        return;
-    }
-
-    if (!s_uid_received || strlen(s_uid) == 0) {
-        ESP_LOGW(TAG, "UID non recu - publication annulee");
-        return;
-    }
-
-    int zone_num  = data->node_id;
-    int sensor_id = data->node_id;
+    if (!s_mqtt_client || !s_uid_received) return;
 
     char topic[128];
-    snprintf(topic, sizeof(topic),
-             "robocare/%s/zone/%d/sensor/%d/data",
-             s_uid, zone_num, sensor_id);
+    snprintf(topic, sizeof(topic), "robocare/%s/zone/%d/sensor/%d/data", s_uid, data->node_id, data->node_id);
 
-    char payload[768];
+    char payload[512];
     snprintf(payload, sizeof(payload),
-             "{"
-               "\"measurements\":{"
-                 "\"moisture_percent\":%.1f,"
-                 "\"temperature_celsius\":%.1f,"
-                 "\"ph\":%.2f,"
-                 "\"conductivity_uS_per_cm\":%.0f,"
-                 "\"nutrients_mg_per_kg\":{"
-                   "\"nitrogen\":%.0f,"
-                   "\"phosphorus\":%.0f,"
-                   "\"potassium\":%.0f"
-                 "}"
-               "},"
-               "\"meta\":{"
-                 "\"mac\":\"%s\","
-                 "\"node_id\":%d,"
-                 "\"rssi\":%d,"
-                 "\"snr\":%.1f,"
-                 "\"date\":\"%s\","
-                 "\"time\":\"%s\""
-               "}"
-             "}",
-             safe_float(data->humidity),
-             safe_float(data->temperature),
-             safe_float(data->ph),
-             safe_float(data->ec),
-             safe_float(data->nitrogen),
-             safe_float(data->phosphorus),
-             safe_float(data->potassium),
-             (strlen(s_mac_str) > 0) ? s_mac_str : "UNKNOWN",
-             data->node_id,
-             data->rssi,
-             data->snr,
-             data->date,
-             data->time_str);
+             "{\"measurements\":{\"moisture_percent\":%.1f,\"temperature_celsius\":%.1f,\"ph\":%.2f,\"conductivity_uS_per_cm\":%.0f},"
+             "\"meta\":{\"mac\":\"%s\",\"node_id\":%d,\"rssi\":%d,\"snr\":%.1f}}",
+             safe_float(data->humidity), safe_float(data->temperature), safe_float(data->ph), safe_float(data->ec),
+             s_mac_str, data->node_id, data->rssi, data->snr);
 
-    int msg_id = esp_mqtt_client_publish(
-        s_mqtt_client, topic, payload, 0, 1, 0);
-
-    if (msg_id >= 0) {
-        ESP_LOGI(TAG, "MQTT PUBLISH OK");
-        ESP_LOGI(TAG, "  Topic   : %s", topic);
-        ESP_LOGI(TAG, "  Payload : %s", payload);
-    } else {
-        ESP_LOGE(TAG, "MQTT publish echoue");
-    }
+    esp_mqtt_client_publish(s_mqtt_client, topic, payload, 0, 1, 0);
 }
 
-void network_manager_set_relay_callback(void (*callback)(int, bool))
-{
-    s_relay_callback = callback;
+void network_manager_set_relay_callback(network_manager_relay_cb_t cb) { s_relay_callback = cb; }
+void network_manager_set_mode_callback(network_manager_mode_cb_t cb) { s_mode_callback = cb; }
+void network_manager_set_timed_irrigation_callback(network_manager_timed_irrigation_cb_t cb) { s_timed_irrigation_callback = cb; }
+
+bool network_manager_is_connected(void) 
+{ 
+    return s_wifi_event_group && (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT); 
 }
 
-const char *network_manager_get_uid(void)
-{
-    return s_uid_received ? s_uid : NULL;
-}
-
-const char *network_manager_get_mac(void)
-{
-    return s_mac_str;
-}
-
-bool network_manager_is_provisioned(void)
-{
-    return s_uid_received && strlen(s_uid) > 0;
-}
-
-bool network_manager_is_connected(void)
-{
-    if (!s_wifi_event_group) return false;
-
-    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-    return (bits & WIFI_CONNECTED_BIT) != 0;
-}
+bool network_manager_is_provisioned(void) { return s_uid_received; }
+const char* network_manager_get_uid(void) { return s_uid_received ? s_uid : NULL; }
+const char* network_manager_get_mac(void) { return s_mac_str; }
