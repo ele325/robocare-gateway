@@ -174,6 +174,9 @@ static void irrigation_start(void)
     if (!pump_on) {
         relay_manager_set(PUMP_RELAY_INDEX, true);    /* démarre pompe */
     }
+
+    /* Mettre à jour l'application mobile */
+    network_manager_publish_relay_state(true, true);
 }
 
 static void irrigation_stop(void)
@@ -195,6 +198,9 @@ static void irrigation_stop(void)
     if (valve_on) {
         relay_manager_set(VALVE_RELAY_INDEX, false);  // Ferme vanne
     }
+
+    /* Mettre à jour l'application mobile */
+    network_manager_publish_relay_state(false, false);
 }
 
 /* ═══════════════════════════════════════════════════════════
