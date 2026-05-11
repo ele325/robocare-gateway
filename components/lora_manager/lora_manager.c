@@ -133,12 +133,7 @@ static bool parse_lora_message(const uint8_t *raw, int len,
     return true;
 }
 
-/* Le reste du fichier (init, RX, callback...) reste inchangé */
-/* =========================================================================
- * lora_manager_init
- *
- * CORRECTION v2.1 : utilise SPI3_HOST (bus LoRa séparé de la SD SPI2_HOST)
- * ========================================================================= */
+
 bool lora_manager_init(int cs_pin, int rst_pin, int dio0_pin)
 {
     /* Reset matériel */
@@ -158,13 +153,7 @@ bool lora_manager_init(int cs_pin, int rst_pin, int dio0_pin)
     gpio_set_level(rst_pin, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    /*
-     * CORRECTION v2.1 : SPI3_HOST au lieu de SPI2_HOST.
-     * La carte réceptrice utilise deux bus SPI distincts :
-     *   SPI2_HOST → SD Card  (IO10 CS, IO11 MOSI, IO12 SCK, IO13 MISO)
-     *   SPI3_HOST → LoRa     (IO34 CS, IO35 MOSI, IO36 SCK, IO37 MISO)
-     * Utiliser SPI2_HOST pour LoRa causait un conflit avec la SD.
-     */
+    
     spi_device_interface_config_t devcfg = {
         .mode           = 0,
         .clock_speed_hz = 1 * 1000 * 1000,
@@ -184,7 +173,6 @@ bool lora_manager_init(int cs_pin, int rst_pin, int dio0_pin)
     ESP_LOGI(TAG, "SX1278 ajouté sur SPI3_HOST  CS=IO%d  RST=IO%d  DIO0=IO%d",
              cs_pin, rst_pin, dio0_pin);
 
-    /* Vérification version chip */
     uint8_t version = lora_read_byte(REG_VERSION);
     ESP_LOGI(TAG, "Registre VERSION = 0x%02X (attendu 0x%02X)",
              version, SX1278_VERSION);

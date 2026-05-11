@@ -59,7 +59,7 @@ const int RELAY_PINS[] = { 5, 4, PUMP_GPIO_PIN, VALVE_GPIO_PIN };
 
 #define WIFI_SSID    "salut"
 #define WIFI_PASS    "hey0000."
-#define MQTT_BROKER  "mqtt://broker.hivemq.com"
+#define MQTT_SERVER  "80.75.212.179"
 #define MQTT_SERVER  MQTT_BROKER   /* alias pour compatibilité */
 #define MQTT_PORT    1883
 #define FIREBASE_UID "2SKcuqIcjSb3a2B6NWs2LebCO4g2"
@@ -81,10 +81,6 @@ static void on_relay_command_received(int relay_idx, bool state);
 static void on_mode_changed(bool auto_mode);
 static void lora_task(void *arg);
 
-/* ═══════════════════════════════════════════════════════════
- * Sécurité démarrage — force GPIO HIGH (relais actif LOW = OFF)
- * ✅ CORRIGÉ : Ajout de IO8 pour la vanne
- * ═══════════════════════════════════════════════════════════ */
 static void gpio_safety_init(void)
 {
     /* Configuration des pins POMPE (IO3) et VANNE (IO8) + autres */
@@ -165,7 +161,7 @@ static void irrigation_start(void)
         return;
     }
 
-    ESP_LOGI(TAG, "🌱 Irrigation START : VANNE (IO8) puis POMPE (IO3)");
+    ESP_LOGI(TAG, "Irrigation START : VANNE (IO8) puis POMPE (IO3)");
 
     if (!valve_on) {
         relay_manager_set(VALVE_RELAY_INDEX, true);   /* ouvre vanne */
@@ -189,7 +185,7 @@ static void irrigation_stop(void)
         return;
     }
 
-    ESP_LOGI(TAG, "🛑 Irrigation STOP : POMPE (IO3) puis VANNE (IO8)");
+    ESP_LOGI(TAG, "Irrigation STOP : POMPE (IO3) puis VANNE (IO8)");
 
     if (pump_on) {
         relay_manager_set(PUMP_RELAY_INDEX, false);   // Arrête pompe
@@ -210,7 +206,7 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
 {
     if (!data) return;
 
-    ESP_LOGI(TAG, "📡 LoRa RX — node=%d hum=%.1f%%", 
+    ESP_LOGI(TAG, " LoRa RX — node=%d hum=%.1f%%", 
              data->node_id, data->humidity);
 
     /* Envoi MQTT */
@@ -228,17 +224,25 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
     /* Logique AUTO */
     if (data->humidity < HUMIDITY_THRESHOLD_ON && !irrigation_active)
     {
-        ESP_LOGI(TAG, "🌱 AUTO → START irrigation (hum=%.1f%% < %d%%)", 
+        ESP_LOGI(TAG, " AUTO → START irrigation (hum=%.1f%% < %d%%)", 
                  data->humidity, (int)HUMIDITY_THRESHOLD_ON);
         irrigation_start();
         irrigation_active = true;
+        
+        /* Supervision de l'app: Mise à jour statut + interrupteurs */
+        network_manager_publish_relay_state(true, true);
+        network_manager_publish_irrigation_status(data->node_id, "STARTED");
     }
     else if (data->humidity > HUMIDITY_THRESHOLD_OFF && irrigation_active)
     {
-        ESP_LOGI(TAG, "🛑 AUTO → STOP irrigation (hum=%.1f%% > %d%%)", 
+        ESP_LOGI(TAG, " AUTO → STOP irrigation (hum=%.1f%% > %d%%)", 
                  data->humidity, (int)HUMIDITY_THRESHOLD_OFF);
         irrigation_stop();
         irrigation_active = false;
+        
+        /* Supervision de l'app: Mise à jour statut + interrupteurs */
+        network_manager_publish_relay_state(false, false);
+        network_manager_publish_irrigation_status(data->node_id, "FINISHED");
     }
     else
     {
@@ -251,7 +255,7 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
  * ═══════════════════════════════════════════════════════════ */
 static void on_relay_command_received(int relay_idx, bool state)
 {
-    ESP_LOGI(TAG, "📱 Commande MQTT reçue — relay_idx=%d state=%s",
+    ESP_LOGI(TAG, "Commande MQTT reçue — relay_idx=%d state=%s",
              relay_idx, state ? "ON" : "OFF");
 
     /* Activer mode manuel (désactive la logique AUTO) */
@@ -305,7 +309,7 @@ done:
  * ═══════════════════════════════════════════════════════════ */
 static void on_mode_changed(bool auto_mode)
 {
-    ESP_LOGI(TAG, "🔄 Mode changé via MQTT : %s", auto_mode ? "AUTO" : "MANUEL");
+    ESP_LOGI(TAG, " Mode changé via MQTT : %s", auto_mode ? "AUTO" : "MANUEL");
     manual_override = !auto_mode;
 }
 
@@ -321,7 +325,7 @@ static void timed_irrigation_task(void *pvParameters)
     int zone = params->zone;
     int seconds = params->seconds;
     
-    ESP_LOGI(TAG, "🕒 Lancement irrigation temporisée : %d secondes (Zone %d)", seconds, zone);
+    ESP_LOGI(TAG, "Lancement irrigation temporisée : %d secondes (Zone %d)", seconds, zone);
 
     manual_override = true; 
     irrigation_start();
@@ -329,7 +333,7 @@ static void timed_irrigation_task(void *pvParameters)
 
     vTaskDelay(pdMS_TO_TICKS(seconds * 1000));
 
-    ESP_LOGI(TAG, "🕒 Temps écoulé, arrêt de l'irrigation...");
+    ESP_LOGI(TAG, "Temps écoulé, arrêt de l'irrigation...");
     irrigation_stop();
 
     /* Notification MQTT pour l'application mobile (status + mise à jour des switches) */
@@ -362,7 +366,7 @@ static void on_timed_irrigation_received(int zone, int seconds)
 static void lora_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "🔄 Tâche LoRa démarrée");
+    ESP_LOGI(TAG, "Tâche LoRa démarrée");
     while (1) {
         lora_manager_process();
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -401,7 +405,7 @@ void app_main(void)
     /* Carte SD */
     sd_manager_set_spi_host(SD_SPI_HOST);
     if (!sd_manager_init(SD_CS_PIN)) {
-        ESP_LOGW(TAG, "⚠️ SD non disponible (optionnel)");
+        ESP_LOGW(TAG, " SD non disponible (optionnel)");
     }
 
     /* Relais - NOUVEAU MAPPING avec VANNE sur IO8 */
@@ -422,8 +426,8 @@ void app_main(void)
              gpio_get_level(VALVE_GPIO_PIN) == on_level ? "ON" : "OFF");
 
     /* Réseau */
-    ESP_LOGI(TAG, "📡 Connexion WiFi/MQTT...");
-    network_manager_init(WIFI_SSID, WIFI_PASS, MQTT_BROKER, MQTT_PORT);
+    ESP_LOGI(TAG, " Connexion WiFi/MQTT...");
+    network_manager_init(WIFI_SSID, WIFI_PASS, MQTT_SERVER, MQTT_PORT);
     /* Enregistrement des callbacks MQTT */
     network_manager_set_relay_callback(on_relay_command_received);
     network_manager_set_mode_callback(on_mode_changed);
@@ -431,13 +435,13 @@ void app_main(void)
     network_manager_start();
 
     /* LoRa */
-    ESP_LOGI(TAG, "📻 Initialisation LoRa...");
+    ESP_LOGI(TAG, " Initialisation LoRa...");
     if (lora_manager_init(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN)) {
         lora_manager_set_callback(on_sensor_data_received);
-        ESP_LOGI(TAG, "✅ LoRa OK");
+        ESP_LOGI(TAG, "LoRa OK");
         xTaskCreate(lora_task, "lora_task", 4096, NULL, 5, NULL);
     } else {
-        ESP_LOGE(TAG, "❌ LoRa ÉCHEC");
+        ESP_LOGE(TAG, " LoRa ÉCHEC");
     }
 
     ESP_LOGI(TAG, "══════════════════════════════════════════════");
