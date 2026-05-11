@@ -217,24 +217,29 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT connecte");
-            if (!s_uid_fixed) {
-                subscribe_config_topic();
-                publish_discovery();
-            }
             if (s_uid_received && strlen(s_uid) > 0) {
+                /* UID déjà connu (NVS ou set_uid) → s'abonner directement aux topics */
                 char sub_topic[128];
-                /* Valve control */
                 snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/valve/control/+", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
-                /* Pump control */
+                ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
+
                 snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/pump/control", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
-                /* Mode control */
+                ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
+
                 snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/mode/control", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
-                /* Timed irrigation */
+                ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
+
                 snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/irrigation/timed/+", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
+                ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
+            } else {
+                /* UID pas encore connu → discovery pour le recevoir du bridge */
+                subscribe_config_topic();
+                publish_discovery();
+                ESP_LOGW(TAG, "UID inconnu → discovery lancé");
             }
             break;
 
@@ -312,11 +317,22 @@ void network_manager_init(const char *ssid, const char *password,
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
+    /* Connexion directe par hostname + port + transport.
+     * On N'utilise PAS .broker.address.uri car http_parser_parse_url() échoue
+     * sur les adresses IPv4 brutes dans certaines versions d'ESP-IDF 5.x,
+     * retournant NULL et empêchant tout démarrage MQTT. */
+    ESP_LOGI(TAG, "Config MQTT : host=%s port=%d (TCP)", mqtt_server, mqtt_port);
+
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = mqtt_server,
-        .broker.address.port = mqtt_port,
+        .broker.address.hostname  = mqtt_server,
+        .broker.address.port      = (uint32_t)mqtt_port,
+        .broker.address.transport = MQTT_TRANSPORT_OVER_TCP,
     };
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (!s_mqtt_client) {
+        ESP_LOGE(TAG, "ERREUR : esp_mqtt_client_init() a retourné NULL !");
+        return;
+    }
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     
     nvs_load_uid();
@@ -350,6 +366,17 @@ void network_manager_publish_sensor_data(const lora_sensor_data_t *data)
 void network_manager_set_relay_callback(network_manager_relay_cb_t cb) { s_relay_callback = cb; }
 void network_manager_set_mode_callback(network_manager_mode_cb_t cb) { s_mode_callback = cb; }
 void network_manager_set_timed_irrigation_callback(network_manager_timed_irrigation_cb_t cb) { s_timed_irrigation_callback = cb; }
+
+void network_manager_set_uid(const char *uid)
+{
+    if (!uid || strlen(uid) == 0) return;
+    strncpy(s_uid, uid, UID_MAX_LEN - 1);
+    s_uid[UID_MAX_LEN - 1] = '\0';
+    s_uid_received = true;
+    s_uid_fixed    = true;
+    nvs_save_uid(s_uid);
+    ESP_LOGI(TAG, "UID forcé manuellement : %s", s_uid);
+}
 
 bool network_manager_is_connected(void) 
 { 

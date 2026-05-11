@@ -59,8 +59,7 @@ const int RELAY_PINS[] = { 5, 4, PUMP_GPIO_PIN, VALVE_GPIO_PIN };
 
 #define WIFI_SSID    "salut"
 #define WIFI_PASS    "hey0000."
-#define MQTT_SERVER  "80.75.212.179"
-#define MQTT_SERVER  MQTT_BROKER   /* alias pour compatibilité */
+#define MQTT_SERVER  "broker.hivemq.com"
 #define MQTT_PORT    1883
 #define FIREBASE_UID "2SKcuqIcjSb3a2B6NWs2LebCO4g2"
 
@@ -418,20 +417,22 @@ void app_main(void)
     
     /* Diagnostic : vérifier l'état des GPIO */
     ESP_LOGI(TAG, "=== DIAGNOSTIC GPIO ===");
-    int on_level = relay_manager_active_level();
+    int off_level_diag = relay_manager_inactive_level();   /* 1 pour actif LOW */
     ESP_LOGI(TAG, "IO%d (POMPE) = %d (%s)",
              PUMP_GPIO_PIN, gpio_get_level(PUMP_GPIO_PIN),
-             gpio_get_level(PUMP_GPIO_PIN) == on_level ? "ON" : "OFF");
+             gpio_get_level(PUMP_GPIO_PIN) == off_level_diag ? "OFF" : "ON");
     ESP_LOGI(TAG, "IO%d (VANNE) = %d (%s)", VALVE_GPIO_PIN, gpio_get_level(VALVE_GPIO_PIN),
-             gpio_get_level(VALVE_GPIO_PIN) == on_level ? "ON" : "OFF");
+             gpio_get_level(VALVE_GPIO_PIN) == off_level_diag ? "OFF" : "ON");
 
     /* Réseau */
     ESP_LOGI(TAG, " Connexion WiFi/MQTT...");
     network_manager_init(WIFI_SSID, WIFI_PASS, MQTT_SERVER, MQTT_PORT);
+    /* Forcer l'UID Firebase (priorité sur NVS \u2014 garantit les subscriptions dès la 1ère connexion) */
+    network_manager_set_uid(FIREBASE_UID);
     /* Enregistrement des callbacks MQTT */
     network_manager_set_relay_callback(on_relay_command_received);
     network_manager_set_mode_callback(on_mode_changed);
-    network_manager_set_timed_irrigation_callback(on_timed_irrigation_received);   /* ← NOUVEAU */
+    network_manager_set_timed_irrigation_callback(on_timed_irrigation_received);
     network_manager_start();
 
     /* LoRa */

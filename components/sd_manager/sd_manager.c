@@ -45,7 +45,7 @@ bool sd_manager_init(int cs_pin)
     }
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
+        .format_if_mount_failed = true,   /* auto-format if FAT is absent/corrupt */
         .max_files              = 5,
         .allocation_unit_size   = 16 * 1024,
     };
