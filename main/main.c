@@ -34,6 +34,11 @@ static const char *TAG = "MAIN_RX";
 
 #define LED_3V3_PIN     14
 
+/* ── Capteurs de Niveau ──────────────────────────────────── */
+#define PIN_LEVEL_LOW   41  /* Niveau Bas (output11) */
+#define PIN_LEVEL_HIGH  42  /* Niveau Haut (output12) */
+
+
 /*
  * Mapping relais.
  *
@@ -51,7 +56,7 @@ const int RELAY_PINS[] = { 5, 4, PUMP_GPIO_PIN, VALVE_GPIO_PIN };
 
 #define NUM_RELAYS          4
 #define PUMP_RELAY_INDEX    2   /* OUTPUT3 / IO3 = POMPE */
-#define VALVE_RELAY_INDEX   3   /* OUTPUT7 / IOx = VANNE (voir VALVE_GPIO_PIN) */
+#define VALVE_RELAY_INDEX   3   /* OUTPUT7 / IO8 = VANNE */
 
 #define HUMIDITY_THRESHOLD_ON   30.0f
 #define HUMIDITY_THRESHOLD_OFF  60.0f
@@ -59,9 +64,10 @@ const int RELAY_PINS[] = { 5, 4, PUMP_GPIO_PIN, VALVE_GPIO_PIN };
 
 #define WIFI_SSID    "salut"
 #define WIFI_PASS    "hey0000."
-#define MQTT_SERVER  "broker.hivemq.com"
+#define MQTT_SERVER  "80.75.212.179"
 #define MQTT_PORT    1883
 #define FIREBASE_UID "2SKcuqIcjSb3a2B6NWs2LebCO4g2"
+
 
 static char g_firebase_uid[128] = {0};
 
@@ -79,6 +85,9 @@ static void on_sensor_data_received(const lora_sensor_data_t *data);
 static void on_relay_command_received(int relay_idx, bool state);
 static void on_mode_changed(bool auto_mode);
 static void lora_task(void *arg);
+static void water_sensor_init(void);
+static void check_water_level(void);
+static void water_level_task(void *arg);
 
 static void gpio_safety_init(void)
 {
@@ -99,9 +108,20 @@ static void gpio_safety_init(void)
     gpio_set_level(PUMP_GPIO_PIN, off_level);   /* POMPE OFF */
     gpio_set_level(4, off_level);  /* OUTPUT2 OFF */
     gpio_set_level(5, off_level);  /* OUTPUT1 OFF */
-    
-    ESP_LOGI("SAFETY", "GPIO forcés OFF(level=%d) — POMPE IO%d, VANNE IO%d",
-             off_level, PUMP_GPIO_PIN, VALVE_GPIO_PIN);
+
+    /* Configuration des capteurs de niveau */
+    gpio_config_t level_sensors = {
+        .pin_bit_mask = (1ULL << PIN_LEVEL_LOW) | (1ULL << PIN_LEVEL_HIGH),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&level_sensors);
+
+    ESP_LOGI("SAFETY", "GPIO forcés OFF(level=%d) — POMPE IO%d, VANNE IO%d | Niveaux: IO%d, IO%d",
+             off_level, PUMP_GPIO_PIN, VALVE_GPIO_PIN, PIN_LEVEL_LOW, PIN_LEVEL_HIGH);
+
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -148,54 +168,113 @@ static void led_3v3_init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════
+ * Capteurs niveau d'eau
+ * ═══════════════════════════════════════════════════════════ */
+static void water_sensor_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << WATER_SENSOR_LOW_PIN) |
+                        (1ULL << WATER_SENSOR_HIGH_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,    /* pull-up interne activé */
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_LOGI(TAG, "Capteurs niveau eau initialisés — BAS:IO%d | HAUT:IO%d",
+             WATER_SENSOR_LOW_PIN, WATER_SENSOR_HIGH_PIN);
+}
+
+static void check_water_level(void)
+{
+    /*
+     * Logique actif LOW (pull-up interne activé) :
+     *   0 = capteur mouillé (dans l'eau)
+     *   1 = capteur sec     (hors de l'eau)
+     *
+     * Priorité absolue sur la logique AUTO et MANUEL :
+     * si réservoir vide  → forcer démarrage pompe
+     * si réservoir plein → forcer arrêt pompe
+     */
+    bool bas_mouille  = (gpio_get_level(WATER_SENSOR_LOW_PIN)  == 0);
+    bool haut_mouille = (gpio_get_level(WATER_SENSOR_HIGH_PIN) == 0);
+
+    if (!bas_mouille && !haut_mouille)
+    {
+        /* ── Réservoir VIDE ── */
+        if (!irrigation_active) {
+            ESP_LOGW(TAG, "NIVEAU EAU : réservoir VIDE → arrêt pompe forcé !");
+            irrigation_stop();
+            irrigation_active = false;
+            network_manager_publish_relay_state(false, false);
+            network_manager_publish_irrigation_status(0, "WATER_EMPTY");
+        }
+    }
+    else if (bas_mouille && haut_mouille)
+    {
+        /* ── Réservoir PLEIN ── */
+        if (irrigation_active) {
+            ESP_LOGI(TAG, "NIVEAU EAU : réservoir PLEIN → arrêt pompe");
+            irrigation_stop();
+            irrigation_active = false;
+            network_manager_publish_relay_state(false, false);
+            network_manager_publish_irrigation_status(0, "WATER_FULL");
+        }
+    }
+    else
+    {
+        /* ── Niveau intermédiaire ── */
+        ESP_LOGI(TAG, "NIVEAU EAU : en cours de remplissage (BAS=%s | HAUT=%s)",
+                 bas_mouille ? "mouillé" : "sec",
+                 haut_mouille ? "mouillé" : "sec");
+    }
+}
+
+static void water_level_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Tâche capteurs niveau eau démarrée");
+    while (1) {
+        check_water_level();
+        vTaskDelay(pdMS_TO_TICKS(2000));   /* vérification toutes les 2s */
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
  * Irrigation
  * ═══════════════════════════════════════════════════════════ */
 static void irrigation_start(void)
 {
     bool valve_on = relay_manager_get(VALVE_RELAY_INDEX);
-    bool pump_on  = relay_manager_get(PUMP_RELAY_INDEX);
 
-    if (valve_on && pump_on) {
-        ESP_LOGI(TAG, "Irrigation déjà active");
+    if (valve_on) {
+        ESP_LOGI(TAG, "Vanne déjà ouverte");
         return;
     }
 
-    ESP_LOGI(TAG, "Irrigation START : VANNE (IO8) puis POMPE (IO3)");
-
-    if (!valve_on) {
-        relay_manager_set(VALVE_RELAY_INDEX, true);   /* ouvre vanne */
-        vTaskDelay(pdMS_TO_TICKS(VALVE_DELAY_MS));
-    }
-    if (!pump_on) {
-        relay_manager_set(PUMP_RELAY_INDEX, true);    /* démarre pompe */
-    }
+    ESP_LOGI(TAG, "Irrigation START : Ouverture VANNE (IO8)");
+    relay_manager_set(VALVE_RELAY_INDEX, true);
 
     /* Mettre à jour l'application mobile */
-    network_manager_publish_relay_state(true, true);
+    network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), 
+                                        relay_manager_get(PUMP_RELAY_INDEX));
 }
 
 static void irrigation_stop(void)
 {
     bool valve_on = relay_manager_get(VALVE_RELAY_INDEX);
-    bool pump_on  = relay_manager_get(PUMP_RELAY_INDEX);
 
-    if (!valve_on && !pump_on) {
-        ESP_LOGI(TAG, "Irrigation déjà arrêtée");
+    if (!valve_on) {
+        ESP_LOGI(TAG, "Vanne déjà fermée");
         return;
     }
 
-    ESP_LOGI(TAG, "Irrigation STOP : POMPE (IO3) puis VANNE (IO8)");
-
-    if (pump_on) {
-        relay_manager_set(PUMP_RELAY_INDEX, false);   // Arrête pompe
-        vTaskDelay(pdMS_TO_TICKS(VALVE_DELAY_MS));    // Attente 500ms
-    }
-    if (valve_on) {
-        relay_manager_set(VALVE_RELAY_INDEX, false);  // Ferme vanne
-    }
+    ESP_LOGI(TAG, "Irrigation STOP : Fermeture VANNE (IO8)");
+    relay_manager_set(VALVE_RELAY_INDEX, false);
 
     /* Mettre à jour l'application mobile */
-    network_manager_publish_relay_state(false, false);
+    network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), 
+                                        relay_manager_get(PUMP_RELAY_INDEX));
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -205,7 +284,7 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
 {
     if (!data) return;
 
-    ESP_LOGI(TAG, " LoRa RX — node=%d hum=%.1f%%", 
+    ESP_LOGI(TAG, " LoRa RX — node=%d hum=%.1f%%",
              data->node_id, data->humidity);
 
     /* Envoi MQTT */
@@ -223,13 +302,13 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
     /* Logique AUTO */
     if (data->humidity < HUMIDITY_THRESHOLD_ON && !irrigation_active)
     {
-        ESP_LOGI(TAG, " AUTO → START irrigation (hum=%.1f%% < %d%%)", 
+        ESP_LOGI(TAG, " AUTO → START irrigation (hum=%.1f%% < %d%%)",
                  data->humidity, (int)HUMIDITY_THRESHOLD_ON);
         irrigation_start();
         irrigation_active = true;
-        
+
         /* Supervision de l'app: Mise à jour statut + interrupteurs */
-        network_manager_publish_relay_state(true, true);
+        network_manager_publish_relay_state(true, relay_manager_get(PUMP_RELAY_INDEX));
         network_manager_publish_irrigation_status(data->node_id, "STARTED");
     }
     else if (data->humidity > HUMIDITY_THRESHOLD_OFF && irrigation_active)
@@ -240,9 +319,10 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
         irrigation_active = false;
         
         /* Supervision de l'app: Mise à jour statut + interrupteurs */
-        network_manager_publish_relay_state(false, false);
+        network_manager_publish_relay_state(false, relay_manager_get(PUMP_RELAY_INDEX));
         network_manager_publish_irrigation_status(data->node_id, "FINISHED");
     }
+
     else
     {
         ESP_LOGI(TAG, "AUTO → aucune action (hum=%.1f%%)", data->humidity);
@@ -323,10 +403,10 @@ static void timed_irrigation_task(void *pvParameters)
     timed_irrig_params_t *params = (timed_irrig_params_t *)pvParameters;
     int zone = params->zone;
     int seconds = params->seconds;
-    
+
     ESP_LOGI(TAG, "Lancement irrigation temporisée : %d secondes (Zone %d)", seconds, zone);
 
-    manual_override = true; 
+    manual_override = true;
     irrigation_start();
     network_manager_publish_irrigation_status(zone, "STARTED");
 
@@ -356,6 +436,41 @@ static void on_timed_irrigation_received(int zone, int seconds)
         params->zone = zone;
         params->seconds = seconds;
         xTaskCreate(timed_irrigation_task, "timed_irrig", 4096, (void*)params, 5, NULL);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════
+ * Tâche de Gestion du Niveau d'Eau (Remplissage Automatique)
+ * ═══════════════════════════════════════════════════════════ */
+static void water_level_task(void *pvParameters)
+{
+    ESP_LOGI("LEVEL", "Tâche de remplissage automatique démarrée");
+    bool filling = false;
+
+    while (1) {
+        int low_val  = gpio_get_level(PIN_LEVEL_LOW);
+        int high_val = gpio_get_level(PIN_LEVEL_HIGH);
+
+        // Si le niveau est BAS (0) et qu'on ne remplit pas déjà
+        if (low_val == 0 && !filling) {
+            ESP_LOGW("LEVEL", "Niveau BAS atteint ! Démarrage POMPE de remplissage...");
+            relay_manager_set(PUMP_RELAY_INDEX, true);
+            filling = true;
+            network_manager_publish_irrigation_status(0, "RESERVOIR_EMPTY_FILLING");
+            network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), true);
+        }
+
+        // Si le niveau est HAUT (1) et qu'on est en train de remplir
+        if (high_val == 1 && filling) {
+            ESP_LOGI("LEVEL", "Niveau HAUT atteint ! Arrêt POMPE de remplissage.");
+            relay_manager_set(PUMP_RELAY_INDEX, false);
+            filling = false;
+            network_manager_publish_irrigation_status(0, "RESERVOIR_FULL");
+            network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), false);
+        }
+
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Vérification toutes les secondes
     }
 }
 
@@ -410,11 +525,11 @@ void app_main(void)
     /* Relais - NOUVEAU MAPPING avec VANNE sur IO8 */
     ESP_LOGI(TAG, " Init relais — POMPE:IO3 | VANNE:IO8");
     relay_manager_init(RELAY_PINS, NUM_RELAYS);
-    
+
     /* Forcer OFF au démarrage */
     relay_manager_set(PUMP_RELAY_INDEX, false);
     relay_manager_set(VALVE_RELAY_INDEX, false);
-    
+
     /* Diagnostic : vérifier l'état des GPIO */
     ESP_LOGI(TAG, "=== DIAGNOSTIC GPIO ===");
     int off_level_diag = relay_manager_inactive_level();   /* 1 pour actif LOW */
@@ -424,10 +539,13 @@ void app_main(void)
     ESP_LOGI(TAG, "IO%d (VANNE) = %d (%s)", VALVE_GPIO_PIN, gpio_get_level(VALVE_GPIO_PIN),
              gpio_get_level(VALVE_GPIO_PIN) == off_level_diag ? "OFF" : "ON");
 
+    /* ── Capteurs niveau d'eau ── */
+    water_sensor_init();
+
     /* Réseau */
     ESP_LOGI(TAG, " Connexion WiFi/MQTT...");
     network_manager_init(WIFI_SSID, WIFI_PASS, MQTT_SERVER, MQTT_PORT);
-    /* Forcer l'UID Firebase (priorité sur NVS \u2014 garantit les subscriptions dès la 1ère connexion) */
+    /* Forcer l'UID Firebase (priorité sur NVS — garantit les subscriptions dès la 1ère connexion) */
     network_manager_set_uid(FIREBASE_UID);
     /* Enregistrement des callbacks MQTT */
     network_manager_set_relay_callback(on_relay_command_received);
@@ -441,17 +559,25 @@ void app_main(void)
         lora_manager_set_callback(on_sensor_data_received);
         ESP_LOGI(TAG, "LoRa OK");
         xTaskCreate(lora_task, "lora_task", 4096, NULL, 5, NULL);
+        xTaskCreate(water_level_task, "water_level", 4096, NULL, 5, NULL);
     } else {
         ESP_LOGE(TAG, " LoRa ÉCHEC");
     }
 
+    /* ── Tâche capteurs niveau d'eau ── */
+    xTaskCreate(water_level_task, "water_level_task", 4096, NULL, 6, NULL);
+
     ESP_LOGI(TAG, "══════════════════════════════════════════════");
     ESP_LOGI(TAG, "  SYSTÈME PRÊT  v2.1");
     ESP_LOGI(TAG, "  POMPE IO%d | VANNE IO%d", PUMP_GPIO_PIN, VALVE_GPIO_PIN);
+    ESP_LOGI(TAG, "  CAPTEUR BAS  : IO%d", WATER_SENSOR_LOW_PIN);
+    ESP_LOGI(TAG, "  CAPTEUR HAUT : IO%d", WATER_SENSOR_HIGH_PIN);
     ESP_LOGI(TAG, "  AUTO  : hum < 30%% → START | hum > 60%% → STOP");
+    ESP_LOGI(TAG, "  NIVEAU EAU : vide → arrêt pompe | plein → arrêt pompe");
     ESP_LOGI(TAG, "  MANUEL: topic mode/control payload=manual");
     ESP_LOGI(TAG, "  RETOUR AUTO : topic mode/control payload=auto");
     ESP_LOGI(TAG, "══════════════════════════════════════════════");
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
