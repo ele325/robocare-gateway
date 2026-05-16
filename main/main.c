@@ -85,8 +85,6 @@ static void on_sensor_data_received(const lora_sensor_data_t *data);
 static void on_relay_command_received(int relay_idx, bool state);
 static void on_mode_changed(bool auto_mode);
 static void lora_task(void *arg);
-static void water_sensor_init(void);
-static void check_water_level(void);
 static void water_level_task(void *arg);
 
 static void gpio_safety_init(void)
@@ -167,78 +165,6 @@ static void led_3v3_init(void)
     ESP_LOGI(TAG, "LED 3V3 ON (IO%d)", LED_3V3_PIN);
 }
 
-/* ═══════════════════════════════════════════════════════════
- * Capteurs niveau d'eau
- * ═══════════════════════════════════════════════════════════ */
-static void water_sensor_init(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << WATER_SENSOR_LOW_PIN) |
-                        (1ULL << WATER_SENSOR_HIGH_PIN),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,    /* pull-up interne activé */
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_conf));
-    ESP_LOGI(TAG, "Capteurs niveau eau initialisés — BAS:IO%d | HAUT:IO%d",
-             WATER_SENSOR_LOW_PIN, WATER_SENSOR_HIGH_PIN);
-}
-
-static void check_water_level(void)
-{
-    /*
-     * Logique actif LOW (pull-up interne activé) :
-     *   0 = capteur mouillé (dans l'eau)
-     *   1 = capteur sec     (hors de l'eau)
-     *
-     * Priorité absolue sur la logique AUTO et MANUEL :
-     * si réservoir vide  → forcer démarrage pompe
-     * si réservoir plein → forcer arrêt pompe
-     */
-    bool bas_mouille  = (gpio_get_level(WATER_SENSOR_LOW_PIN)  == 0);
-    bool haut_mouille = (gpio_get_level(WATER_SENSOR_HIGH_PIN) == 0);
-
-    if (!bas_mouille && !haut_mouille)
-    {
-        /* ── Réservoir VIDE ── */
-        if (!irrigation_active) {
-            ESP_LOGW(TAG, "NIVEAU EAU : réservoir VIDE → arrêt pompe forcé !");
-            irrigation_stop();
-            irrigation_active = false;
-            network_manager_publish_relay_state(false, false);
-            network_manager_publish_irrigation_status(0, "WATER_EMPTY");
-        }
-    }
-    else if (bas_mouille && haut_mouille)
-    {
-        /* ── Réservoir PLEIN ── */
-        if (irrigation_active) {
-            ESP_LOGI(TAG, "NIVEAU EAU : réservoir PLEIN → arrêt pompe");
-            irrigation_stop();
-            irrigation_active = false;
-            network_manager_publish_relay_state(false, false);
-            network_manager_publish_irrigation_status(0, "WATER_FULL");
-        }
-    }
-    else
-    {
-        /* ── Niveau intermédiaire ── */
-        ESP_LOGI(TAG, "NIVEAU EAU : en cours de remplissage (BAS=%s | HAUT=%s)",
-                 bas_mouille ? "mouillé" : "sec",
-                 haut_mouille ? "mouillé" : "sec");
-    }
-}
-
-static void water_level_task(void *arg)
-{
-    (void)arg;
-    ESP_LOGI(TAG, "Tâche capteurs niveau eau démarrée");
-    while (1) {
-        check_water_level();
-        vTaskDelay(pdMS_TO_TICKS(2000));   /* vérification toutes les 2s */
-    }
-}
 
 /* ═══════════════════════════════════════════════════════════
  * Irrigation
@@ -540,7 +466,6 @@ void app_main(void)
              gpio_get_level(VALVE_GPIO_PIN) == off_level_diag ? "OFF" : "ON");
 
     /* ── Capteurs niveau d'eau ── */
-    water_sensor_init();
 
     /* Réseau */
     ESP_LOGI(TAG, " Connexion WiFi/MQTT...");
@@ -564,16 +489,15 @@ void app_main(void)
         ESP_LOGE(TAG, " LoRa ÉCHEC");
     }
 
-    /* ── Tâche capteurs niveau d'eau ── */
-    xTaskCreate(water_level_task, "water_level_task", 4096, NULL, 6, NULL);
-
     ESP_LOGI(TAG, "══════════════════════════════════════════════");
+
     ESP_LOGI(TAG, "  SYSTÈME PRÊT  v2.1");
     ESP_LOGI(TAG, "  POMPE IO%d | VANNE IO%d", PUMP_GPIO_PIN, VALVE_GPIO_PIN);
-    ESP_LOGI(TAG, "  CAPTEUR BAS  : IO%d", WATER_SENSOR_LOW_PIN);
-    ESP_LOGI(TAG, "  CAPTEUR HAUT : IO%d", WATER_SENSOR_HIGH_PIN);
+    ESP_LOGI(TAG, "  CAPTEUR BAS  : IO%d", PIN_LEVEL_LOW);
+    ESP_LOGI(TAG, "  CAPTEUR HAUT : IO%d", PIN_LEVEL_HIGH);
     ESP_LOGI(TAG, "  AUTO  : hum < 30%% → START | hum > 60%% → STOP");
-    ESP_LOGI(TAG, "  NIVEAU EAU : vide → arrêt pompe | plein → arrêt pompe");
+    ESP_LOGI(TAG, "  REMPLISSAGE : auto entre BAS et HAUT");
+
     ESP_LOGI(TAG, "  MANUEL: topic mode/control payload=manual");
     ESP_LOGI(TAG, "  RETOUR AUTO : topic mode/control payload=auto");
     ESP_LOGI(TAG, "══════════════════════════════════════════════");
