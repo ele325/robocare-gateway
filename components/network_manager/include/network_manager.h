@@ -58,9 +58,9 @@ void network_manager_publish_sensor_data(const lora_sensor_data_t *data);
 void network_manager_publish_irrigation_status(int zone, const char *status);
 
 /**
- * @brief Publie l'état d'un relais sur MQTT (pour mise à jour UI mobile).
- * Pompe  : robocare/{uid}/pump/control  → "0" ou "1"
- * Vanne  : robocare/{uid}/valve/control/{zone} → "0" ou "1"
+ * @brief Publie l'état des actionneurs sur MQTT (pour mise à jour UI mobile).
+ * Pompe  : robocare/{uid}/pump/state  → "0" ou "1"
+ * Vanne  : robocare/{uid}/valve/state/{zone} → "0" ou "1"
  */
 void network_manager_publish_relay_state(bool pump, bool valve);
 

@@ -37,6 +37,8 @@ static const char *TAG = "MAIN_RX";
 /* ── Capteurs de Niveau ──────────────────────────────────── */
 #define PIN_LEVEL_LOW   41  /* Niveau Bas (output11) */
 #define PIN_LEVEL_HIGH  42  /* Niveau Haut (output12) */
+#define LEVEL_SENSOR_ACTIVE_LEVEL 0 /* Avec pull-up: capteur atteint => GPIO=0 */
+#define LEVEL_DEBOUNCE_SAMPLES 3
 
 
 /*
@@ -76,6 +78,7 @@ static char g_firebase_uid[128] = {0};
  * ═══════════════════════════════════════════════════════════ */
 static bool irrigation_active = false;
 static bool manual_override   = false;
+static volatile bool reservoir_filling_active = false;
 static void led_3v3_init(void);
 static void spi_sd_bus_init(void);
 static void spi_lora_bus_init(void);
@@ -86,6 +89,12 @@ static void on_relay_command_received(int relay_idx, bool state);
 static void on_mode_changed(bool auto_mode);
 static void lora_task(void *arg);
 static void water_level_task(void *arg);
+static bool is_level_sensor_triggered(int gpio_level);
+
+static bool is_level_sensor_triggered(int gpio_level)
+{
+    return gpio_level == LEVEL_SENSOR_ACTIVE_LEVEL;
+}
 
 static void gpio_safety_init(void)
 {
@@ -182,8 +191,8 @@ static void irrigation_start(void)
     relay_manager_set(VALVE_RELAY_INDEX, true);
 
     /* Mettre à jour l'application mobile */
-    network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), 
-                                        relay_manager_get(PUMP_RELAY_INDEX));
+    network_manager_publish_relay_state(relay_manager_get(PUMP_RELAY_INDEX),
+                                        relay_manager_get(VALVE_RELAY_INDEX));
 }
 
 static void irrigation_stop(void)
@@ -199,8 +208,8 @@ static void irrigation_stop(void)
     relay_manager_set(VALVE_RELAY_INDEX, false);
 
     /* Mettre à jour l'application mobile */
-    network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), 
-                                        relay_manager_get(PUMP_RELAY_INDEX));
+    network_manager_publish_relay_state(relay_manager_get(PUMP_RELAY_INDEX),
+                                        relay_manager_get(VALVE_RELAY_INDEX));
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -225,6 +234,12 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
         return;
     }
 
+    /* Tant que le reservoir n'est pas plein, on n'active pas l'irrigation auto. */
+    if (reservoir_filling_active || !is_level_sensor_triggered(gpio_get_level(PIN_LEVEL_HIGH))) {
+        ESP_LOGW(TAG, "AUTO irrigation bloquee: reservoir en remplissage ou niveau haut non atteint");
+        return;
+    }
+
     /* Logique AUTO */
     if (data->humidity < HUMIDITY_THRESHOLD_ON && !irrigation_active)
     {
@@ -234,7 +249,8 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
         irrigation_active = true;
 
         /* Supervision de l'app: Mise à jour statut + interrupteurs */
-        network_manager_publish_relay_state(true, relay_manager_get(PUMP_RELAY_INDEX));
+        network_manager_publish_relay_state(relay_manager_get(PUMP_RELAY_INDEX),
+                                            relay_manager_get(VALVE_RELAY_INDEX));
         network_manager_publish_irrigation_status(data->node_id, "STARTED");
     }
     else if (data->humidity > HUMIDITY_THRESHOLD_OFF && irrigation_active)
@@ -245,7 +261,8 @@ static void on_sensor_data_received(const lora_sensor_data_t *data)
         irrigation_active = false;
         
         /* Supervision de l'app: Mise à jour statut + interrupteurs */
-        network_manager_publish_relay_state(false, relay_manager_get(PUMP_RELAY_INDEX));
+        network_manager_publish_relay_state(relay_manager_get(PUMP_RELAY_INDEX),
+                                            relay_manager_get(VALVE_RELAY_INDEX));
         network_manager_publish_irrigation_status(data->node_id, "FINISHED");
     }
 
@@ -263,37 +280,20 @@ static void on_relay_command_received(int relay_idx, bool state)
     ESP_LOGI(TAG, "Commande MQTT reçue — relay_idx=%d state=%s",
              relay_idx, state ? "ON" : "OFF");
 
-    /* Activer mode manuel (désactive la logique AUTO) */
-    manual_override = true;
-
     if (relay_idx == PUMP_RELAY_INDEX) {
-        if (relay_manager_get(PUMP_RELAY_INDEX) == state) {
-            ESP_LOGI(TAG, "Pompe déjà à l'état demandé → ignoré");
-            goto done;
-        }
-        if (state) {
-            /* Sécurité: ouvrir la vanne avant d'allumer la pompe */
-            if (!relay_manager_get(VALVE_RELAY_INDEX)) {
-                relay_manager_set(VALVE_RELAY_INDEX, true);
-                vTaskDelay(pdMS_TO_TICKS(VALVE_DELAY_MS));
-            }
-            relay_manager_set(PUMP_RELAY_INDEX, true);
-        } else {
-            relay_manager_set(PUMP_RELAY_INDEX, false);
-        }
+        ESP_LOGW(TAG, "Commande MQTT POMPE ignoree: la pompe est reservee au remplissage auto");
+        goto done;
     } else if (relay_idx == VALVE_RELAY_INDEX) {
         if (relay_manager_get(VALVE_RELAY_INDEX) == state) {
             ESP_LOGI(TAG, "Vanne déjà à l'état demandé → ignoré");
             goto done;
         }
+        /* Vraie commande MQTT externe (pas un simple écho d'état) */
+        manual_override = true;
         if (state) {
             relay_manager_set(VALVE_RELAY_INDEX, true);
         } else {
-            /* Sécurité: couper la pompe avant de fermer la vanne */
-            if (relay_manager_get(PUMP_RELAY_INDEX)) {
-                relay_manager_set(PUMP_RELAY_INDEX, false);
-                vTaskDelay(pdMS_TO_TICKS(VALVE_DELAY_MS));
-            }
+            /* Prototype: la vanne irrigation est indépendante de la pompe de remplissage. */
             relay_manager_set(VALVE_RELAY_INDEX, false);
         }
     } else {
@@ -301,9 +301,8 @@ static void on_relay_command_received(int relay_idx, bool state)
     }
 
 done:
-    /* État global irrigation = (pompe ON et vanne ON) */
-    irrigation_active =
-        relay_manager_get(PUMP_RELAY_INDEX) && relay_manager_get(VALVE_RELAY_INDEX);
+    /* État irrigation = état de la vanne (pas de la pompe de remplissage). */
+    irrigation_active = relay_manager_get(VALVE_RELAY_INDEX);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -372,27 +371,38 @@ static void water_level_task(void *pvParameters)
 {
     ESP_LOGI("LEVEL", "Tâche de remplissage automatique démarrée");
     bool filling = false;
+    int low_stable_count = 0;
+    int high_stable_count = 0;
 
     while (1) {
         int low_val  = gpio_get_level(PIN_LEVEL_LOW);
         int high_val = gpio_get_level(PIN_LEVEL_HIGH);
 
-        // Si le niveau est BAS (0) et qu'on ne remplit pas déjà
-        if (low_val == 0 && !filling) {
+        const bool low_triggered  = is_level_sensor_triggered(low_val);
+        const bool high_triggered = is_level_sensor_triggered(high_val);
+        low_stable_count = low_triggered ? (low_stable_count + 1) : 0;
+        high_stable_count = high_triggered ? (high_stable_count + 1) : 0;
+
+        // Si le niveau est BAS atteint et qu'on ne remplit pas déjà
+        if ((low_stable_count >= LEVEL_DEBOUNCE_SAMPLES) &&
+            !filling &&
+            (high_stable_count == 0)) {
             ESP_LOGW("LEVEL", "Niveau BAS atteint ! Démarrage POMPE de remplissage...");
             relay_manager_set(PUMP_RELAY_INDEX, true);
             filling = true;
+            reservoir_filling_active = true;
             network_manager_publish_irrigation_status(0, "RESERVOIR_EMPTY_FILLING");
-            network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), true);
+            network_manager_publish_relay_state(true, relay_manager_get(VALVE_RELAY_INDEX));
         }
 
-        // Si le niveau est HAUT (1) et qu'on est en train de remplir
-        if (high_val == 1 && filling) {
+        // Si le niveau est HAUT atteint et qu'on est en train de remplir
+        else if ((high_stable_count >= LEVEL_DEBOUNCE_SAMPLES) && filling) {
             ESP_LOGI("LEVEL", "Niveau HAUT atteint ! Arrêt POMPE de remplissage.");
             relay_manager_set(PUMP_RELAY_INDEX, false);
             filling = false;
+            reservoir_filling_active = false;
             network_manager_publish_irrigation_status(0, "RESERVOIR_FULL");
-            network_manager_publish_relay_state(relay_manager_get(VALVE_RELAY_INDEX), false);
+            network_manager_publish_relay_state(false, relay_manager_get(VALVE_RELAY_INDEX));
         }
 
 

@@ -155,10 +155,9 @@ void network_manager_publish_relay_state(bool pump, bool valve)
     char topic_pump[128];
     char topic_valve[128];
     
-    /* Assuming zone 1 for the automatic valve update for now. 
-       In a multi-zone setup, we'd need to know which zone to update. */
-    snprintf(topic_pump, sizeof(topic_pump), "robocare/%s/pump/control", s_uid);
-    snprintf(topic_valve, sizeof(topic_valve), "robocare/%s/valve/control/1", s_uid);
+    /* Publier l'état sur des topics STATE pour éviter de réinjecter des commandes. */
+    snprintf(topic_pump, sizeof(topic_pump), "robocare/%s/pump/state", s_uid);
+    snprintf(topic_valve, sizeof(topic_valve), "robocare/%s/valve/state/1", s_uid);
 
     esp_mqtt_client_publish(s_mqtt_client, topic_pump, pump ? "1" : "0", 0, 1, 0);
     esp_mqtt_client_publish(s_mqtt_client, topic_valve, valve ? "1" : "0", 0, 1, 0);
@@ -224,10 +223,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
                 ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
 
-                snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/pump/control", s_uid);
-                esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
-                ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
-
                 snprintf(sub_topic, sizeof(sub_topic), "robocare/%s/mode/control", s_uid);
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
                 ESP_LOGI(TAG, "Subscribe : %s", sub_topic);
@@ -277,8 +272,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 if (s_mode_callback) s_mode_callback(strcmp(payload, "auto") == 0);
             } 
             else if (np >= 4 && strcmp(parts[2], "pump") == 0) {
-                if (s_relay_callback) s_relay_callback(2, strcmp(payload, "1") == 0); // PUMP_RELAY_INDEX = 2
-            } 
+                ESP_LOGW(TAG, "Commande POMPE ignoree via MQTT (pompe reservee au remplissage auto)");
+            }
             else if (np >= 5 && strcmp(parts[2], "valve") == 0) {
                 if (s_relay_callback) s_relay_callback(3, strcmp(payload, "1") == 0); // VALVE_RELAY_INDEX = 3
             }
