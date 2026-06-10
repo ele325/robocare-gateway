@@ -98,23 +98,30 @@ static bool is_level_sensor_triggered(int gpio_level)
 
 static void gpio_safety_init(void)
 {
-    /* Configuration des pins POMPE (IO3) et VANNE (IO8) + autres */
+    const int off_level = relay_manager_inactive_level();
+
+    /* Forcer le niveau OFF AVANT gpio_config pour éviter un glitch à 0 */
+    gpio_set_level(VALVE_GPIO_PIN, off_level);
+    gpio_set_level(PUMP_GPIO_PIN, off_level);
+    gpio_set_level(4, off_level);
+    gpio_set_level(5, off_level);
+
+    /* Puis configurer les pins en sortie */
     gpio_config_t safe = {
         .pin_bit_mask = (1ULL << VALVE_GPIO_PIN) | (1ULL << PUMP_GPIO_PIN) |
-                        (1ULL << 4) | (1ULL << 5),    /* IO4 et IO5 (libres) */
+                        (1ULL << 4) | (1ULL << 5),
         .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,           /* ← Activer pull-up ! */
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&safe);
 
-    /* Forcer niveau INACTIF (OFF) selon le câblage actif LOW/HIGH */
-    const int off_level = relay_manager_inactive_level();
-    gpio_set_level(VALVE_GPIO_PIN, off_level);  /* VANNE OFF */
-    gpio_set_level(PUMP_GPIO_PIN, off_level);   /* POMPE OFF */
-    gpio_set_level(4, off_level);  /* OUTPUT2 OFF */
-    gpio_set_level(5, off_level);  /* OUTPUT1 OFF */
+    /* Force le drive strength au max pour contrer le pull-down du module */
+    gpio_set_drive_capability(VALVE_GPIO_PIN, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PUMP_GPIO_PIN, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(4, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(5, GPIO_DRIVE_CAP_3);
 
     /* Configuration des capteurs de niveau */
     gpio_config_t level_sensors = {

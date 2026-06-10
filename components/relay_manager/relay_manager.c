@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "hal/gpio_types.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -89,8 +90,10 @@ void relay_manager_init(const int *pins, int num_pins)
     }
     memset(s_relay_states, 0, s_num_relays * sizeof(bool));
 
-    /* ✅ Configuration avec PULL-UP activé */
+    /* ✅ Configuration sans glitch : set_level AVANT gpio_config */
     for (int i = 0; i < s_num_relays; i++) {
+        gpio_set_level(s_relay_pins[i], RELAY_INACTIVE_LEVEL);
+
         gpio_config_t io_conf = {
             .pin_bit_mask = (1ULL << s_relay_pins[i]),
             .mode         = GPIO_MODE_OUTPUT,
@@ -99,9 +102,10 @@ void relay_manager_init(const int *pins, int num_pins)
             .intr_type    = GPIO_INTR_DISABLE,
         };
         gpio_config(&io_conf);
-        gpio_set_level(s_relay_pins[i], RELAY_INACTIVE_LEVEL);
-        
-        /* Forcer HIGH une seconde fois pour être sûr */
+
+        /* Force le drive strength au max pour contrer le pull-down du module */
+        gpio_set_drive_capability(s_relay_pins[i], GPIO_DRIVE_CAP_3);
+
         vTaskDelay(pdMS_TO_TICKS(10));
         gpio_set_level(s_relay_pins[i], RELAY_INACTIVE_LEVEL);
     }
